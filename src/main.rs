@@ -1,44 +1,5 @@
-//! cc-toolgate: PreToolUse hook for Claude Code.
-//!
-//! Validates Bash tool calls with compound-command-aware parsing.
-//! Reads JSON from stdin, writes a permission decision to stdout.
-//!
-//! Handles:
-//!   - Command chaining: &&, ||, ;
-//!   - Pipes: |, |&
-//!   - Command substitution: $(), backticks
-//!   - Process substitution: <(), >()
-//!   - Output redirection: >, >>, 2>, &>, etc.
-//!   - Quoting awareness (won't split inside quotes)
-
 use serde::Deserialize;
 use std::io::Read;
-use std::io::Write;
-
-// ─── Types ───────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Decision {
-    Allow,
-    Ask,
-    Deny,
-}
-
-impl Decision {
-    fn as_str(self) -> &'static str {
-        match self {
-            Decision::Allow => "allow",
-            Decision::Ask => "ask",
-            Decision::Deny => "deny",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct RuleMatch {
-    decision: Decision,
-    reason: String,
-}
 
 #[derive(Deserialize)]
 struct HookInput {
@@ -50,982 +11,6 @@ struct HookInput {
 struct ToolInput {
     command: Option<String>,
 }
-
-// ─── Parsing ─────────────────────────────────────────
-
-/// Split a command at shell operators (&&, ||, ;, |, |&),
-/// respecting single/double quotes and backslash escapes.
-fn split_compound_command(command: &str) -> (Vec<String>, Vec<String>) {
-    let mut parts = Vec::new();
-    let mut operators = Vec::new();
-    let mut buf = String::new();
-
-    let chars: Vec<char> = command.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-    let (mut sq, mut dq, mut esc) = (false, false, false);
-
-    while i < len {
-        let c = chars[i];
-
-        if esc {
-            buf.push(c);
-            esc = false;
-            i += 1;
-            continue;
-        }
-        if c == '\\' && !sq {
-            esc = true;
-            buf.push(c);
-            i += 1;
-            continue;
-        }
-        if c == '\'' && !dq {
-            sq = !sq;
-            buf.push(c);
-            i += 1;
-            continue;
-        }
-        if c == '"' && !sq {
-            dq = !dq;
-            buf.push(c);
-            i += 1;
-            continue;
-        }
-        if sq || dq {
-            buf.push(c);
-            i += 1;
-            continue;
-        }
-
-        // Two-char operators
-        if i + 1 < len {
-            let two: String = chars[i..=i + 1].iter().collect();
-            if two == "&&" || two == "||" || two == "|&" {
-                let trimmed = buf.trim().to_string();
-                parts.push(trimmed);
-                operators.push(two);
-                buf.clear();
-                i += 2;
-                continue;
-            }
-        }
-
-        // Single-char operators
-        if c == '|' || c == ';' {
-            let trimmed = buf.trim().to_string();
-            parts.push(trimmed);
-            operators.push(c.to_string());
-            buf.clear();
-            i += 1;
-            continue;
-        }
-
-        buf.push(c);
-        i += 1;
-    }
-
-    let tail = buf.trim().to_string();
-    if !tail.is_empty() {
-        parts.push(tail);
-    }
-
-    // Filter empties
-    parts.retain(|p| !p.is_empty());
-
-    (parts, operators)
-}
-
-/// Extract command substitution contents from `$(...)` and backticks.
-/// Returns the outer command with substitutions replaced by `__SUBST__`
-/// placeholders, plus a vec of the extracted inner command strings.
-///
-/// Handles nesting: `$(cat $(which foo))` extracts `cat $(which foo)`,
-/// which is then recursively evaluated by `evaluate()`.
-///
-/// `$()` is extracted even inside double quotes (shell expands it there).
-/// Only single quotes block substitution detection.
-fn extract_substitutions(command: &str) -> (String, Vec<String>) {
-    let chars: Vec<char> = command.chars().collect();
-    let len = chars.len();
-    let mut outer = String::new();
-    let mut inners = Vec::new();
-    let mut i = 0;
-    let (mut sq, mut dq, mut esc) = (false, false, false);
-
-    while i < len {
-        let c = chars[i];
-
-        if esc {
-            outer.push(c);
-            esc = false;
-            i += 1;
-            continue;
-        }
-        if c == '\\' && !sq {
-            esc = true;
-            outer.push(c);
-            i += 1;
-            continue;
-        }
-        if c == '\'' && !dq {
-            sq = !sq;
-            outer.push(c);
-            i += 1;
-            continue;
-        }
-        if c == '"' && !sq {
-            dq = !dq;
-            outer.push(c);
-            i += 1;
-            continue;
-        }
-        // Single quotes block all substitution
-        if sq {
-            outer.push(c);
-            i += 1;
-            continue;
-        }
-
-        // $( — extract balanced content
-        if c == '$' && i + 1 < len && chars[i + 1] == '(' {
-            let mut depth: u32 = 1;
-            let mut inner = String::new();
-            let (mut isq, mut idq, mut iesc) = (false, false, false);
-            i += 2; // skip $(
-            while i < len && depth > 0 {
-                let ic = chars[i];
-                if iesc {
-                    inner.push(ic);
-                    iesc = false;
-                    i += 1;
-                    continue;
-                }
-                if ic == '\\' && !isq {
-                    iesc = true;
-                    inner.push(ic);
-                    i += 1;
-                    continue;
-                }
-                if ic == '\'' && !idq {
-                    isq = !isq;
-                    inner.push(ic);
-                    i += 1;
-                    continue;
-                }
-                if ic == '"' && !isq {
-                    idq = !idq;
-                    inner.push(ic);
-                    i += 1;
-                    continue;
-                }
-                if !isq && !idq {
-                    if ic == '(' {
-                        depth += 1;
-                    }
-                    if ic == ')' {
-                        depth -= 1;
-                        if depth == 0 {
-                            i += 1;
-                            break;
-                        }
-                    }
-                }
-                inner.push(ic);
-                i += 1;
-            }
-            let trimmed = inner.trim().to_string();
-            if !trimmed.is_empty() {
-                inners.push(trimmed);
-            }
-            outer.push_str("__SUBST__");
-            continue;
-        }
-
-        // Backtick — extract to matching backtick (no nesting)
-        if c == '`' {
-            let mut inner = String::new();
-            i += 1; // skip opening `
-            while i < len && chars[i] != '`' {
-                if chars[i] == '\\' && i + 1 < len {
-                    inner.push(chars[i]);
-                    inner.push(chars[i + 1]);
-                    i += 2;
-                    continue;
-                }
-                inner.push(chars[i]);
-                i += 1;
-            }
-            if i < len {
-                i += 1; // skip closing `
-            }
-            let trimmed = inner.trim().to_string();
-            if !trimmed.is_empty() {
-                inners.push(trimmed);
-            }
-            outer.push_str("__SUBST__");
-            continue;
-        }
-
-        // Process substitution <() / >() — extract inner command
-        if (c == '<' || c == '>') && i + 1 < len && chars[i + 1] == '(' && !dq {
-            let mut depth: u32 = 1;
-            let mut inner = String::new();
-            let (mut isq, mut idq, mut iesc) = (false, false, false);
-            i += 2; // skip <( or >(
-            while i < len && depth > 0 {
-                let ic = chars[i];
-                if iesc {
-                    inner.push(ic);
-                    iesc = false;
-                    i += 1;
-                    continue;
-                }
-                if ic == '\\' && !isq {
-                    iesc = true;
-                    inner.push(ic);
-                    i += 1;
-                    continue;
-                }
-                if ic == '\'' && !idq {
-                    isq = !isq;
-                    inner.push(ic);
-                    i += 1;
-                    continue;
-                }
-                if ic == '"' && !isq {
-                    idq = !idq;
-                    inner.push(ic);
-                    i += 1;
-                    continue;
-                }
-                if !isq && !idq {
-                    if ic == '(' {
-                        depth += 1;
-                    }
-                    if ic == ')' {
-                        depth -= 1;
-                        if depth == 0 {
-                            i += 1;
-                            break;
-                        }
-                    }
-                }
-                inner.push(ic);
-                i += 1;
-            }
-            let trimmed = inner.trim().to_string();
-            if !trimmed.is_empty() {
-                inners.push(trimmed);
-            }
-            // Don't include < or > prefix — would false-trigger redirection detection
-            outer.push_str("__SUBST__");
-            continue;
-        }
-
-        outer.push(c);
-        i += 1;
-    }
-
-    (outer, inners)
-}
-
-/// Detect output redirection (>, >>, &>, fd>) outside quotes.
-/// Does NOT flag:
-///   - Input redirection (<) or here-docs (<<, <<<)
-///   - fd-to-fd duplication: >&N, N>&M, >&-, N>&- (e.g. 2>&1)
-fn has_output_redirection(command: &str) -> Option<String> {
-    let chars: Vec<char> = command.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-    let (mut sq, mut dq, mut esc) = (false, false, false);
-
-    while i < len {
-        let c = chars[i];
-
-        if esc {
-            esc = false;
-            i += 1;
-            continue;
-        }
-        if c == '\\' && !sq {
-            esc = true;
-            i += 1;
-            continue;
-        }
-        if c == '\'' && !dq {
-            sq = !sq;
-            i += 1;
-            continue;
-        }
-        if c == '"' && !sq {
-            dq = !dq;
-            i += 1;
-            continue;
-        }
-        if sq || dq {
-            i += 1;
-            continue;
-        }
-
-        // &> or &>> (redirect both stdout+stderr to file — always mutation)
-        if c == '&' && i + 1 < len && chars[i + 1] == '>' {
-            return Some("output redirection (&>)".into());
-        }
-
-        // fd redirects: N>, N>>, N>&M, N>&-
-        if c.is_ascii_digit() && i + 1 < len && chars[i + 1] == '>' {
-            // N>&M or N>&- is fd duplication/closing, not file output
-            if i + 2 < len && chars[i + 2] == '&'
-                && i + 3 < len && (chars[i + 3].is_ascii_digit() || chars[i + 3] == '-')
-            {
-                i += 4;
-                continue;
-            }
-            return Some(format!("output redirection ({c}>)"));
-        }
-
-        // > or >> but NOT >( (process substitution), >&N, or >&-
-        if c == '>' {
-            if i + 1 < len && chars[i + 1] == '(' {
-                i += 1;
-                continue;
-            }
-            // >&N or >&- is fd duplication/closing
-            if i + 1 < len && chars[i + 1] == '&'
-                && i + 2 < len && (chars[i + 2].is_ascii_digit() || chars[i + 2] == '-')
-            {
-                i += 3;
-                continue;
-            }
-            return Some("output redirection (>)".into());
-        }
-
-        i += 1;
-    }
-
-    None
-}
-
-/// Extract the first real command word, skipping leading VAR=value assignments.
-fn base_command(command: &str) -> String {
-    let mut rest = command.trim();
-    // Skip VAR=value prefixes
-    loop {
-        if let Some(eq_pos) = rest.find('=') {
-            let before_eq = &rest[..eq_pos];
-            if !before_eq.is_empty()
-                && before_eq
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && before_eq
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            {
-                let after_eq = &rest[eq_pos + 1..];
-                if let Some(sp) = after_eq.find(char::is_whitespace) {
-                    rest = after_eq[sp..].trim_start();
-                    continue;
-                }
-            }
-        }
-        break;
-    }
-    rest.split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string()
-}
-
-/// Extract leading KEY=VALUE pairs.
-fn env_vars(command: &str) -> Vec<(String, String)> {
-    let mut result = Vec::new();
-    let mut rest = command.trim();
-    loop {
-        if let Some(eq_pos) = rest.find('=') {
-            let before_eq = &rest[..eq_pos];
-            if !before_eq.is_empty()
-                && before_eq
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && before_eq
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            {
-                let after_eq = &rest[eq_pos + 1..];
-                if let Some(sp) = after_eq.find(char::is_whitespace) {
-                    let key = before_eq.to_string();
-                    let val = after_eq[..sp].to_string();
-                    result.push((key, val));
-                    rest = after_eq[sp..].trim_start();
-                    continue;
-                }
-            }
-        }
-        break;
-    }
-    result
-}
-
-/// Extract the git subcommand word (e.g. "push" from "git push origin main").
-fn git_subcommand(command: &str) -> Option<String> {
-    let mut iter = command.split_whitespace();
-    for word in iter.by_ref() {
-        if word == "git" {
-            return iter.next().map(|s| s.to_string());
-        }
-    }
-    None
-}
-
-// ─── Rule sets ───────────────────────────────────────
-//
-// Adjust these to match your intent.
-
-/// Git subcommands that are auto-allowed WITH AI gitconfig.
-const GIT_ALLOWED_WITH_CONFIG: &[&str] = &["push", "pull", "status", "add"];
-
-/// Git subcommands that are read-only and safe without AI gitconfig.
-const GIT_READ_ONLY: &[&str] = &[
-    "log", "diff", "show", "branch", "tag", "remote",
-    "rev-parse", "ls-files", "ls-tree", "shortlog",
-    "blame", "describe", "stash",
-];
-
-const KUBECTL_READ_ONLY: &[&str] = &[
-    "get",
-    "describe",
-    "logs",
-    "top",
-    "explain",
-    "api-resources",
-    "api-versions",
-    "version",
-    "cluster-info",
-];
-
-const KUBECTL_MUTATING: &[&str] = &[
-    "apply",
-    "delete",
-    "rollout",
-    "scale",
-    "autoscale",
-    "patch",
-    "replace",
-    "create",
-    "edit",
-    "drain",
-    "cordon",
-    "uncordon",
-    "taint",
-    "exec",
-    "run",
-    "port-forward",
-    "cp",
-];
-
-const DENY_COMMANDS: &[&str] = &[
-    "shred",    // destructive filesystem
-    "dd",       // disk operations
-    "mkfs", "fdisk", "parted",
-    "shutdown", // system control
-    "reboot", "halt", "poweroff",
-    "eval",     // dynamic execution
-];
-
-const ASK_COMMANDS: &[&str] = &[
-    "rm", "rmdir",  // destructive but sometimes needed
-    "sudo", "su", "doas", "pkexec", // privilege escalation
-    "mkdir", "touch", // create files/dirs
-    "mv", "cp", "ln", // move/copy/link
-    "chmod", "chown", "chgrp", // permission changes
-    "tee",  // writes to files (even though it also outputs to stdout)
-    "curl", "wget", // network access
-    "pip", "pip3", "npm", "npx", "yarn", "pnpm", // package managers
-    "python", "python3", "node", "ruby", "perl", // interpreters (can do anything)
-    "make", "cmake", "ninja", // build systems
-];
-
-const ALLOW_COMMANDS: &[&str] = &[
-    "ls", "tree", "which", "cd", "chdir", "pwd",
-    // File reading (redirection caught separately)
-    "cat", "head", "tail", "less", "more",
-    // Text output
-    "echo", "printf",
-    // Text processing (read-only to stdout; redirection caught separately)
-    "grep", "sort", "uniq", "diff", "comm", "tr", "cut", "rev", "wc",
-    "column", "paste", "expand", "unexpand", "fold", "fmt", "nl",
-    // File/path info
-    "stat", "file", "dirname", "basename", "realpath", "readlink",
-    // System info
-    "uname", "hostname", "id", "whoami", "groups", "nproc",
-    "uptime", "arch", "date", "free", "df", "du", "lsblk",
-    // Environment
-    "env", "printenv", "locale",
-    // Shell builtins / control
-    "test", "[", "true", "false", "type", "command", "hash",
-    "export", "unset", "set", "source", ".",
-    "sleep", "seq", "yes",
-    // Process inspection
-    "ps", "top", "htop", "pgrep",
-    // Directory listing (find is read-only; redirection caught separately)
-    "find",
-    // Misc safe
-    "xargs", "clear", "tput", "reset",
-    // Rust-based CLI tools (deployed on ai-dev container)
-    "eza",       // ls replacement
-    "bat",       // cat replacement
-    "fd",        // find replacement
-    "rg",        // grep replacement (ripgrep)
-    "sd",        // sed replacement
-    "dust",      // du replacement
-    "procs",     // ps replacement
-    "tokei",     // code stats
-    "delta",     // diff viewer
-    "zoxide",    // cd replacement
-    "hyperfine", // benchmarking
-    "just",      // command runner
-];
-
-/// Cargo subcommands that are safe (build / check / informational).
-const CARGO_SAFE: &[&str] = &[
-    "build", "check", "test", "bench", "run",
-    "clippy", "fmt", "doc", "clean", "update",
-    "fetch", "tree", "metadata", "version",
-    "verify-project", "search", "generate-lockfile",
-];
-
-/// gh CLI subcommands that are read-only.
-const GH_READ_ONLY: &[&str] = &[
-    "status",
-    // repo
-    "repo view", "repo list", "repo clone",
-    // pr
-    "pr list", "pr view", "pr diff", "pr checks", "pr status",
-    // issue
-    "issue list", "issue view", "issue status",
-    // run / workflow
-    "run list", "run view", "run watch",
-    "workflow list", "workflow view",
-    // release
-    "release list", "release view",
-    // misc read
-    "search", "browse", "api",
-    "auth status", "auth token",
-    "extension list",
-    "label list",
-    "cache list",
-    "variable list", "variable get",
-    "secret list",
-];
-
-/// gh CLI subcommands that mutate state (create, modify, delete).
-const GH_MUTATING: &[&str] = &[
-    // repo
-    "repo create", "repo delete", "repo edit", "repo fork", "repo rename", "repo archive",
-    // pr
-    "pr create", "pr merge", "pr close", "pr reopen", "pr comment", "pr review", "pr edit",
-    // issue
-    "issue create", "issue close", "issue reopen", "issue comment", "issue edit",
-    "issue delete", "issue transfer", "issue pin", "issue unpin",
-    // run / workflow
-    "run rerun", "run cancel", "run delete",
-    "workflow enable", "workflow disable", "workflow run",
-    // release
-    "release create", "release delete", "release edit",
-    // misc write
-    "auth login", "auth logout", "auth refresh",
-    "extension install", "extension remove", "extension upgrade",
-    "label create", "label edit", "label delete",
-    "cache delete",
-    "variable set", "variable delete",
-    "secret set", "secret delete",
-    "config set",
-];
-
-// ─── Evaluation ──────────────────────────────────────
-
-fn in_set(set: &[&str], val: &str) -> bool {
-    set.contains(&val)
-}
-
-/// Evaluate a single (non-compound) command against the rule set.
-fn evaluate_single(command: &str) -> RuleMatch {
-    let cmd = command.trim();
-    if cmd.is_empty() {
-        return RuleMatch {
-            decision: Decision::Allow,
-            reason: "empty".into(),
-        };
-    }
-
-    let base = base_command(cmd);
-    let envs = env_vars(cmd);
-    let redir = has_output_redirection(cmd);
-    let has_ai_config = envs.iter().any(|(k, _)| k == "GIT_CONFIG_GLOBAL");
-
-    // ── Deny list (also matches dotted variants like mkfs.ext4) ──
-    let base_prefix = base.split('.').next().unwrap_or("");
-    if in_set(DENY_COMMANDS, &base) || in_set(DENY_COMMANDS, base_prefix) {
-        return RuleMatch {
-            decision: Decision::Deny,
-            reason: format!("blocked command: {base}"),
-        };
-    }
-
-    // ── --version on any non-denied command (short invocations) ──
-    // Only --version is universal. -V means different things in different tools
-    // (e.g. tar -V is --verbose). -V is handled per-tool where known safe.
-    if cmd.split_whitespace().count() <= 3
-        && cmd.split_whitespace().any(|w| w == "--version")
-    {
-        return RuleMatch {
-            decision: Decision::Allow,
-            reason: format!("{base} --version"),
-        };
-    }
-
-    // ── Git ──
-    if base == "git" || (has_ai_config && cmd.contains("git")) {
-        let sub = git_subcommand(cmd);
-        let sub_str = sub.as_deref().unwrap_or("?");
-
-        // Force-push → ask regardless of config
-        if sub_str == "push" {
-            let force_flags = ["--force", "--force-with-lease", "-f"];
-            if cmd.split_whitespace().any(|w| force_flags.contains(&w)) {
-                return RuleMatch {
-                    decision: Decision::Ask,
-                    reason: "git force-push requires confirmation".into(),
-                };
-            }
-        }
-
-        // Read-only git subcommands — allowed without AI gitconfig
-        if in_set(GIT_READ_ONLY, sub_str) {
-            if let Some(r) = redir {
-                return RuleMatch {
-                    decision: Decision::Ask,
-                    reason: format!("git {sub_str} with {r}"),
-                };
-            }
-            return RuleMatch {
-                decision: Decision::Allow,
-                reason: format!("read-only git {sub_str}"),
-            };
-        }
-
-        // Write git subcommands require AI gitconfig
-        if in_set(GIT_ALLOWED_WITH_CONFIG, sub_str) {
-            if has_ai_config {
-                if let Some(r) = redir {
-                    return RuleMatch {
-                        decision: Decision::Ask,
-                        reason: format!("git {sub_str} with {r}"),
-                    };
-                }
-                return RuleMatch {
-                    decision: Decision::Allow,
-                    reason: format!("git {sub_str} with AI gitconfig"),
-                };
-            }
-            return RuleMatch {
-                decision: Decision::Ask,
-                reason: format!("git {sub_str} without AI gitconfig"),
-            };
-        }
-
-        return RuleMatch {
-            decision: Decision::Ask,
-            reason: format!("git {sub_str} requires confirmation"),
-        };
-    }
-
-    // ── kubectl ──
-    if base == "kubectl" {
-        let sub = cmd
-            .split_whitespace()
-            .skip(1)
-            .find(|w| !w.starts_with('-'));
-        let sub_str = sub.unwrap_or("?");
-
-        if in_set(KUBECTL_READ_ONLY, sub_str) {
-            if let Some(r) = redir {
-                return RuleMatch {
-                    decision: Decision::Ask,
-                    reason: format!("kubectl {sub_str} with {r}"),
-                };
-            }
-            return RuleMatch {
-                decision: Decision::Allow,
-                reason: format!("read-only kubectl {sub_str}"),
-            };
-        }
-
-        if in_set(KUBECTL_MUTATING, sub_str) {
-            return RuleMatch {
-                decision: Decision::Ask,
-                reason: format!("kubectl {sub_str} requires confirmation"),
-            };
-        }
-
-        return RuleMatch {
-            decision: Decision::Ask,
-            reason: format!("kubectl {sub_str} requires confirmation"),
-        };
-    }
-
-    // ── cargo ──
-    if base == "cargo" {
-        let sub = cmd
-            .split_whitespace()
-            .skip(1)
-            .find(|w| !w.starts_with('-'));
-        let sub_str = sub.unwrap_or("?");
-
-        if in_set(CARGO_SAFE, sub_str) {
-            if let Some(r) = redir {
-                return RuleMatch {
-                    decision: Decision::Ask,
-                    reason: format!("cargo {sub_str} with {r}"),
-                };
-            }
-            return RuleMatch {
-                decision: Decision::Allow,
-                reason: format!("cargo {sub_str}"),
-            };
-        }
-
-        // --version / -V at any position
-        if cmd.split_whitespace().any(|w| w == "--version" || w == "-V") {
-            return RuleMatch {
-                decision: Decision::Allow,
-                reason: "cargo --version".into(),
-            };
-        }
-
-        return RuleMatch {
-            decision: Decision::Ask,
-            reason: format!("cargo {sub_str} requires confirmation"),
-        };
-    }
-
-    // ── gh CLI ──
-    if base == "gh" {
-        let words: Vec<&str> = cmd.split_whitespace().collect();
-        // gh subcommands are two words (e.g. "pr list") or one word (e.g. "status")
-        let sub_two = if words.len() >= 3 {
-            format!("{} {}", words[1], words[2])
-        } else {
-            String::new()
-        };
-        let sub_one = words.get(1).copied().unwrap_or("?");
-
-        if in_set(GH_READ_ONLY, &sub_two) || in_set(GH_READ_ONLY, sub_one) {
-            if let Some(r) = redir {
-                return RuleMatch {
-                    decision: Decision::Ask,
-                    reason: format!("gh {sub_one} with {r}"),
-                };
-            }
-            return RuleMatch {
-                decision: Decision::Allow,
-                reason: format!("read-only gh {sub_two}"),
-            };
-        }
-
-        if in_set(GH_MUTATING, &sub_two) || in_set(GH_MUTATING, sub_one) {
-            return RuleMatch {
-                decision: Decision::Ask,
-                reason: format!("gh {sub_two} requires confirmation"),
-            };
-        }
-
-        return RuleMatch {
-            decision: Decision::Ask,
-            reason: format!("gh {sub_one} requires confirmation"),
-        };
-    }
-
-    // ── Ask list (destructive / privileged) ──
-    if in_set(ASK_COMMANDS, &base) {
-        return RuleMatch {
-            decision: Decision::Ask,
-            reason: format!("{base} requires confirmation"),
-        };
-    }
-
-    // ── Allow list ──
-    if in_set(ALLOW_COMMANDS, &base) {
-        if let Some(r) = redir {
-            return RuleMatch {
-                decision: Decision::Ask,
-                reason: format!("{base} with {r}"),
-            };
-        }
-        return RuleMatch {
-            decision: Decision::Allow,
-            reason: format!("allowed: {base}"),
-        };
-    }
-
-    // ── Fallthrough → ask ──
-    RuleMatch {
-        decision: Decision::Ask,
-        reason: format!("unrecognized command: {base}"),
-    }
-}
-
-fn decision_label(d: Decision) -> &'static str {
-    match d {
-        Decision::Allow => "ALLOW",
-        Decision::Ask => "ASK",
-        Decision::Deny => "DENY",
-    }
-}
-
-/// Evaluate a full command string, handling compound expressions and substitutions.
-///
-/// Substitutions (`$(...)`, backticks, `<()`, `>()`) are extracted and recursively
-/// evaluated. The outer command (with placeholders) and each compound part are
-/// evaluated via `evaluate_single`. Worst decision wins across all parts.
-fn evaluate(command: &str) -> RuleMatch {
-    let (outer, inners) = extract_substitutions(command);
-    let (parts, operators) = split_compound_command(&outer);
-
-    // Simple case: no substitutions and not compound → evaluate directly
-    if parts.len() <= 1 && inners.is_empty() {
-        return evaluate_single(command);
-    }
-
-    let mut worst = Decision::Allow;
-    let mut reasons = Vec::new();
-
-    // Recursively evaluate substitution contents
-    for inner in &inners {
-        let result = evaluate(inner);
-        let label: String = inner.trim().chars().take(60).collect();
-        reasons.push(format!(
-            "  subst[$({label})] -> {}: {}",
-            decision_label(result.decision),
-            result.reason
-        ));
-        if result.decision > worst {
-            worst = result.decision;
-        }
-    }
-
-    // Evaluate each part of the (possibly compound) outer command
-    for part in &parts {
-        let result = evaluate_single(part);
-        let label: String = part.trim().chars().take(60).collect();
-        reasons.push(format!(
-            "  [{label}] -> {}: {}",
-            decision_label(result.decision),
-            result.reason
-        ));
-        if result.decision > worst {
-            worst = result.decision;
-        }
-    }
-
-    // Build summary header
-    let mut desc = Vec::new();
-    if !operators.is_empty() {
-        let mut unique_ops: Vec<&str> = operators.iter().map(|s| s.as_str()).collect();
-        unique_ops.sort();
-        unique_ops.dedup();
-        desc.push(unique_ops.join(", "));
-    }
-    if !inners.is_empty() {
-        desc.push(format!("{} substitution(s)", inners.len()));
-    }
-    let header = if desc.is_empty() {
-        "compound command".into()
-    } else {
-        format!("compound command ({})", desc.join("; "))
-    };
-
-    RuleMatch {
-        decision: worst,
-        reason: format!("{}:\n{}", header, reasons.join("\n")),
-    }
-}
-
-// ─── Logging ─────────────────────────────────────────
-
-/// Append a decision record to ~/.local/share/cc-toolgate/decisions.log.
-/// Best-effort: failures are silently ignored (logging must never block the hook).
-fn log_decision(command: &str, result: &RuleMatch) {
-    let Some(home) = std::env::var_os("HOME") else {
-        return;
-    };
-    let log_dir = std::path::Path::new(&home)
-        .join(".local/share/cc-toolgate");
-    let _ = std::fs::create_dir_all(&log_dir);
-
-    let log_path = log_dir.join("decisions.log");
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-    else {
-        return;
-    };
-
-    // Compact single-line reason for the log (replace newlines with "; ")
-    let reason_oneline = result.reason.replace('\n', "; ");
-    let cmd_truncated: String = command.chars().take(200).collect();
-    let ts = timestamp_now();
-
-    let _ = writeln!(
-        file,
-        "{ts}\t{decision}\t{cmd}\t{reason}",
-        decision = result.decision.as_str(),
-        cmd = cmd_truncated,
-        reason = reason_oneline,
-    );
-}
-
-/// Simple UTC timestamp without external deps.
-fn timestamp_now() -> String {
-    // Read /proc/self/stat for uptime would be overkill.
-    // Use SystemTime for a basic ISO-ish timestamp.
-    let dur = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = dur.as_secs();
-    // Convert to rough UTC: days/hours/mins/secs
-    let days = secs / 86400;
-    let rem = secs % 86400;
-    let h = rem / 3600;
-    let m = (rem % 3600) / 60;
-    let s = rem % 60;
-    // Days since epoch → approximate date (good enough for log ordering)
-    // 2000-01-01 = day 10957 from epoch
-    let (year, month, day) = epoch_days_to_date(days);
-    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
-}
-
-/// Convert days since Unix epoch to (year, month, day).
-fn epoch_days_to_date(days: u64) -> (u64, u64, u64) {
-    // Civil calendar from days algorithm (Howard Hinnant)
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
-// ─── Entry point ─────────────────────────────────────
 
 fn main() {
     let mut input = String::new();
@@ -1055,10 +40,10 @@ fn main() {
         std::process::exit(0);
     }
 
-    let result = evaluate(&command);
+    let result = cc_toolgate::evaluate(&command);
 
     // Log decision to ~/.local/share/cc-toolgate/decisions.log
-    log_decision(&command, &result);
+    cc_toolgate::logging::log_decision(&command, &result);
 
     let output = serde_json::json!({
         "hookSpecificOutput": {
@@ -1071,18 +56,16 @@ fn main() {
     println!("{}", serde_json::to_string(&output).unwrap());
 }
 
-// ─── Tests ───────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use cc_toolgate::eval::Decision;
 
     fn decision_for(command: &str) -> Decision {
-        evaluate(command).decision
+        cc_toolgate::evaluate(command).decision
     }
 
     fn reason_for(command: &str) -> String {
-        evaluate(command).reason
+        cc_toolgate::evaluate(command).reason
     }
 
     // ── ALLOW ──
@@ -1600,7 +583,6 @@ mod tests {
 
     #[test]
     fn fd_dup_2_to_1() {
-        // 2>&1 is fd duplication, not file output → should not escalate
         assert_eq!(decision_for("ls -la 2>&1"), Decision::Allow);
     }
 
@@ -1611,25 +593,21 @@ mod tests {
 
     #[test]
     fn fd_dup_bare_to_2() {
-        // >&2 is shorthand for 1>&2
         assert_eq!(decision_for("ls -la >&2"), Decision::Allow);
     }
 
     #[test]
     fn fd_close_2() {
-        // 2>&- closes stderr
         assert_eq!(decision_for("ls -la 2>&-"), Decision::Allow);
     }
 
     #[test]
     fn fd_dup_with_real_redir() {
-        // 2>&1 is fine but > file is still mutation
         assert_eq!(decision_for("ls -la > /tmp/out 2>&1"), Decision::Ask);
     }
 
     #[test]
     fn fd_dup_cargo_test() {
-        // Common pattern: cargo test 2>&1 | rg FAILED
         assert_eq!(
             decision_for("cargo test 2>&1 | rg FAILED"),
             Decision::Allow
@@ -1743,7 +721,6 @@ mod tests {
 
     #[test]
     fn subst_both_allowed() {
-        // ls is ALLOW, which is ALLOW → overall ALLOW
         assert_eq!(decision_for("ls $(which cargo)"), Decision::Allow);
     }
 
@@ -1754,47 +731,36 @@ mod tests {
 
     #[test]
     fn subst_inner_ask() {
-        // ls is ALLOW, rm is ASK → overall ASK
         assert_eq!(decision_for("ls $(rm -rf /tmp)"), Decision::Ask);
     }
 
     #[test]
     fn subst_inner_deny() {
-        // ls is ALLOW, shred is DENY → overall DENY
         assert_eq!(decision_for("ls $(shred foo)"), Decision::Deny);
     }
 
     #[test]
     fn subst_all_allowed() {
-        // echo is ALLOW, cat is ALLOW → overall ALLOW
         assert_eq!(decision_for("echo $(cat /etc/passwd)"), Decision::Allow);
     }
 
     #[test]
     fn subst_backtick_all_allowed() {
-        // echo is ALLOW, whoami is ALLOW → overall ALLOW
         assert_eq!(decision_for("echo `whoami`"), Decision::Allow);
     }
 
     #[test]
     fn subst_nested_all_allowed() {
-        // Inner: cat $(which foo) → which is ALLOW, cat is ALLOW
-        // Outer: ls __SUBST__ → ALLOW
-        // Overall: ALLOW
         assert_eq!(decision_for("ls $(cat $(which foo))"), Decision::Allow);
     }
 
     #[test]
     fn subst_single_quoted_not_expanded() {
-        // Single quotes prevent substitution extraction
-        // echo is ALLOW, no subst extracted → ALLOW
         assert_eq!(decision_for("echo '$(rm -rf /)'"), Decision::Allow);
     }
 
     #[test]
     fn subst_double_quoted_expanded() {
-        // Double quotes do NOT block $() expansion
-        // Inner: rm -rf / → ASK
         assert_eq!(decision_for("echo \"$(rm -rf /)\""), Decision::Ask);
         let r = reason_for("echo \"$(rm -rf /)\"");
         assert!(
@@ -1805,15 +771,11 @@ mod tests {
 
     #[test]
     fn subst_process_subst_no_false_redir() {
-        // Process substitution >() should NOT trigger output redirection detection
-        // diff is ALLOW, sort is ALLOW → overall ALLOW
         assert_eq!(decision_for("diff <(sort a) <(sort b)"), Decision::Allow);
     }
 
     #[test]
     fn subst_in_compound_allow() {
-        // ls $(which cargo) && bat $(fd '*.rs')
-        // All parts and substitutions are ALLOW
         assert_eq!(
             decision_for("ls $(which cargo) && bat $(fd '*.rs')"),
             Decision::Allow
@@ -1822,8 +784,6 @@ mod tests {
 
     #[test]
     fn subst_in_compound_deny() {
-        // ls $(shred foo) && bat README.md
-        // Inner shred is DENY → overall DENY
         assert_eq!(
             decision_for("ls $(shred foo) && bat README.md"),
             Decision::Deny
@@ -1834,13 +794,11 @@ mod tests {
 
     #[test]
     fn quoted_redirect_single() {
-        // > inside single quotes is NOT real redirection; echo is now ALLOW
         assert_eq!(decision_for("echo 'hello > world'"), Decision::Allow);
     }
 
     #[test]
     fn quoted_chain_double() {
-        // && inside double quotes should NOT split; echo is now ALLOW
         assert_eq!(decision_for("echo \"a && b\""), Decision::Allow);
     }
 

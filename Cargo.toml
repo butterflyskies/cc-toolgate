@@ -1,6 +1,6 @@
 [package]
 name = "cc-toolgate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "PreToolUse hook for Claude Code that gates Bash commands with compound-command-aware validation"
 license = "MIT"
@@ -8,6 +8,13 @@ license = "MIT"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+winnow = "0.7"
+shlex = "1"
+log = "0.4"
+simplelog = "0.12"
+
+[dev-dependencies]
+proptest = "1"
 
 [profile.release]
 strip = true
