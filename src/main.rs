@@ -40,6 +40,9 @@ fn main() {
         std::process::exit(0);
     }
 
+    // Init logging (best-effort, no-op on failure)
+    cc_toolgate::logging::init();
+
     let result = cc_toolgate::evaluate(&command);
 
     // Log decision to ~/.local/share/cc-toolgate/decisions.log
