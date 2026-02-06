@@ -135,11 +135,20 @@ fn split_compound_command(command: &str) -> (Vec<String>, Vec<String>) {
     (parts, operators)
 }
 
-/// Detect command substitution ($(), backticks) or process substitution
-/// outside single quotes.
-fn has_substitution(command: &str) -> Option<&'static str> {
+/// Extract command substitution contents from `$(...)` and backticks.
+/// Returns the outer command with substitutions replaced by `__SUBST__`
+/// placeholders, plus a vec of the extracted inner command strings.
+///
+/// Handles nesting: `$(cat $(which foo))` extracts `cat $(which foo)`,
+/// which is then recursively evaluated by `evaluate()`.
+///
+/// `$()` is extracted even inside double quotes (shell expands it there).
+/// Only single quotes block substitution detection.
+fn extract_substitutions(command: &str) -> (String, Vec<String>) {
     let chars: Vec<char> = command.chars().collect();
     let len = chars.len();
+    let mut outer = String::new();
+    let mut inners = Vec::new();
     let mut i = 0;
     let (mut sq, mut dq, mut esc) = (false, false, false);
 
@@ -147,48 +156,183 @@ fn has_substitution(command: &str) -> Option<&'static str> {
         let c = chars[i];
 
         if esc {
+            outer.push(c);
             esc = false;
             i += 1;
             continue;
         }
         if c == '\\' && !sq {
             esc = true;
+            outer.push(c);
             i += 1;
             continue;
         }
         if c == '\'' && !dq {
             sq = !sq;
+            outer.push(c);
             i += 1;
             continue;
         }
         if c == '"' && !sq {
             dq = !dq;
+            outer.push(c);
             i += 1;
             continue;
         }
+        // Single quotes block all substitution
         if sq {
+            outer.push(c);
             i += 1;
             continue;
         }
 
+        // $( — extract balanced content
         if c == '$' && i + 1 < len && chars[i + 1] == '(' {
-            return Some("command substitution $(…)");
-        }
-        if c == '`' {
-            return Some("backtick substitution");
-        }
-        if (c == '<' || c == '>') && i + 1 < len && chars[i + 1] == '(' {
-            return Some("process substitution");
+            let mut depth: u32 = 1;
+            let mut inner = String::new();
+            let (mut isq, mut idq, mut iesc) = (false, false, false);
+            i += 2; // skip $(
+            while i < len && depth > 0 {
+                let ic = chars[i];
+                if iesc {
+                    inner.push(ic);
+                    iesc = false;
+                    i += 1;
+                    continue;
+                }
+                if ic == '\\' && !isq {
+                    iesc = true;
+                    inner.push(ic);
+                    i += 1;
+                    continue;
+                }
+                if ic == '\'' && !idq {
+                    isq = !isq;
+                    inner.push(ic);
+                    i += 1;
+                    continue;
+                }
+                if ic == '"' && !isq {
+                    idq = !idq;
+                    inner.push(ic);
+                    i += 1;
+                    continue;
+                }
+                if !isq && !idq {
+                    if ic == '(' {
+                        depth += 1;
+                    }
+                    if ic == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                inner.push(ic);
+                i += 1;
+            }
+            let trimmed = inner.trim().to_string();
+            if !trimmed.is_empty() {
+                inners.push(trimmed);
+            }
+            outer.push_str("__SUBST__");
+            continue;
         }
 
+        // Backtick — extract to matching backtick (no nesting)
+        if c == '`' {
+            let mut inner = String::new();
+            i += 1; // skip opening `
+            while i < len && chars[i] != '`' {
+                if chars[i] == '\\' && i + 1 < len {
+                    inner.push(chars[i]);
+                    inner.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                inner.push(chars[i]);
+                i += 1;
+            }
+            if i < len {
+                i += 1; // skip closing `
+            }
+            let trimmed = inner.trim().to_string();
+            if !trimmed.is_empty() {
+                inners.push(trimmed);
+            }
+            outer.push_str("__SUBST__");
+            continue;
+        }
+
+        // Process substitution <() / >() — extract inner command
+        if (c == '<' || c == '>') && i + 1 < len && chars[i + 1] == '(' && !dq {
+            let mut depth: u32 = 1;
+            let mut inner = String::new();
+            let (mut isq, mut idq, mut iesc) = (false, false, false);
+            i += 2; // skip <( or >(
+            while i < len && depth > 0 {
+                let ic = chars[i];
+                if iesc {
+                    inner.push(ic);
+                    iesc = false;
+                    i += 1;
+                    continue;
+                }
+                if ic == '\\' && !isq {
+                    iesc = true;
+                    inner.push(ic);
+                    i += 1;
+                    continue;
+                }
+                if ic == '\'' && !idq {
+                    isq = !isq;
+                    inner.push(ic);
+                    i += 1;
+                    continue;
+                }
+                if ic == '"' && !isq {
+                    idq = !idq;
+                    inner.push(ic);
+                    i += 1;
+                    continue;
+                }
+                if !isq && !idq {
+                    if ic == '(' {
+                        depth += 1;
+                    }
+                    if ic == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                inner.push(ic);
+                i += 1;
+            }
+            let trimmed = inner.trim().to_string();
+            if !trimmed.is_empty() {
+                inners.push(trimmed);
+            }
+            // Don't include < or > prefix — would false-trigger redirection detection
+            outer.push_str("__SUBST__");
+            continue;
+        }
+
+        outer.push(c);
         i += 1;
     }
 
-    None
+    (outer, inners)
 }
 
 /// Detect output redirection (>, >>, &>, fd>) outside quotes.
-/// Does NOT flag input redirection (<) or here-docs (<<, <<<).
+/// Does NOT flag:
+///   - Input redirection (<) or here-docs (<<, <<<)
+///   - fd-to-fd duplication: >&N, N>&M, >&-, N>&- (e.g. 2>&1)
 fn has_output_redirection(command: &str) -> Option<String> {
     let chars: Vec<char> = command.chars().collect();
     let len = chars.len();
@@ -223,23 +367,37 @@ fn has_output_redirection(command: &str) -> Option<String> {
             continue;
         }
 
-        // &> or &>>
+        // &> or &>> (redirect both stdout+stderr to file — always mutation)
         if c == '&' && i + 1 < len && chars[i + 1] == '>' {
             return Some("output redirection (&>)".into());
         }
 
-        // > or >> but NOT >( (process substitution)
+        // fd redirects: N>, N>>, N>&M, N>&-
+        if c.is_ascii_digit() && i + 1 < len && chars[i + 1] == '>' {
+            // N>&M or N>&- is fd duplication/closing, not file output
+            if i + 2 < len && chars[i + 2] == '&'
+                && i + 3 < len && (chars[i + 3].is_ascii_digit() || chars[i + 3] == '-')
+            {
+                i += 4;
+                continue;
+            }
+            return Some(format!("output redirection ({c}>)"));
+        }
+
+        // > or >> but NOT >( (process substitution), >&N, or >&-
         if c == '>' {
             if i + 1 < len && chars[i + 1] == '(' {
                 i += 1;
                 continue;
             }
+            // >&N or >&- is fd duplication/closing
+            if i + 1 < len && chars[i + 1] == '&'
+                && i + 2 < len && (chars[i + 2].is_ascii_digit() || chars[i + 2] == '-')
+            {
+                i += 3;
+                continue;
+            }
             return Some("output redirection (>)".into());
-        }
-
-        // fd redirects: 1>, 2>, etc.
-        if c.is_ascii_digit() && i + 1 < len && chars[i + 1] == '>' {
-            return Some(format!("output redirection ({c}>)"));
         }
 
         i += 1;
@@ -687,34 +845,38 @@ fn evaluate_single(command: &str) -> RuleMatch {
     }
 }
 
-/// Evaluate a full command string, handling compound expressions.
-fn evaluate(command: &str) -> RuleMatch {
-    if let Some(sub) = has_substitution(command) {
-        return RuleMatch {
-            decision: Decision::Ask,
-            reason: format!("contains {sub}"),
-        };
+fn decision_label(d: Decision) -> &'static str {
+    match d {
+        Decision::Allow => "ALLOW",
+        Decision::Ask => "ASK",
+        Decision::Deny => "DENY",
     }
+}
 
-    let (parts, operators) = split_compound_command(command);
+/// Evaluate a full command string, handling compound expressions and substitutions.
+///
+/// Substitutions (`$(...)`, backticks, `<()`, `>()`) are extracted and recursively
+/// evaluated. The outer command (with placeholders) and each compound part are
+/// evaluated via `evaluate_single`. Worst decision wins across all parts.
+fn evaluate(command: &str) -> RuleMatch {
+    let (outer, inners) = extract_substitutions(command);
+    let (parts, operators) = split_compound_command(&outer);
 
-    if parts.len() <= 1 {
+    // Simple case: no substitutions and not compound → evaluate directly
+    if parts.len() <= 1 && inners.is_empty() {
         return evaluate_single(command);
     }
 
     let mut worst = Decision::Allow;
     let mut reasons = Vec::new();
 
-    for part in &parts {
-        let result = evaluate_single(part);
-        let label: String = part.trim().chars().take(60).collect();
+    // Recursively evaluate substitution contents
+    for inner in &inners {
+        let result = evaluate(inner);
+        let label: String = inner.trim().chars().take(60).collect();
         reasons.push(format!(
-            "  [{label}] -> {}: {}",
-            match result.decision {
-                Decision::Allow => "ALLOW",
-                Decision::Ask => "ASK",
-                Decision::Deny => "DENY",
-            },
+            "  subst[$({label})] -> {}: {}",
+            decision_label(result.decision),
             result.reason
         ));
         if result.decision > worst {
@@ -722,15 +884,40 @@ fn evaluate(command: &str) -> RuleMatch {
         }
     }
 
-    let mut unique_ops: Vec<&str> = operators.iter().map(|s| s.as_str()).collect();
-    unique_ops.sort();
-    unique_ops.dedup();
-    let ops = unique_ops.join(", ");
-    let summary = format!("compound command ({ops}):\n{}", reasons.join("\n"));
+    // Evaluate each part of the (possibly compound) outer command
+    for part in &parts {
+        let result = evaluate_single(part);
+        let label: String = part.trim().chars().take(60).collect();
+        reasons.push(format!(
+            "  [{label}] -> {}: {}",
+            decision_label(result.decision),
+            result.reason
+        ));
+        if result.decision > worst {
+            worst = result.decision;
+        }
+    }
+
+    // Build summary header
+    let mut desc = Vec::new();
+    if !operators.is_empty() {
+        let mut unique_ops: Vec<&str> = operators.iter().map(|s| s.as_str()).collect();
+        unique_ops.sort();
+        unique_ops.dedup();
+        desc.push(unique_ops.join(", "));
+    }
+    if !inners.is_empty() {
+        desc.push(format!("{} substitution(s)", inners.len()));
+    }
+    let header = if desc.is_empty() {
+        "compound command".into()
+    } else {
+        format!("compound command ({})", desc.join("; "))
+    };
 
     RuleMatch {
         decision: worst,
-        reason: summary,
+        reason: format!("{}:\n{}", header, reasons.join("\n")),
     }
 }
 
@@ -1085,6 +1272,46 @@ mod tests {
         );
     }
 
+    // ── fd duplication (NOT mutation) ──
+
+    #[test]
+    fn fd_dup_2_to_1() {
+        // 2>&1 is fd duplication, not file output → should not escalate
+        assert_eq!(decision_for("ls -la 2>&1"), Decision::Allow);
+    }
+
+    #[test]
+    fn fd_dup_1_to_2() {
+        assert_eq!(decision_for("ls -la 1>&2"), Decision::Allow);
+    }
+
+    #[test]
+    fn fd_dup_bare_to_2() {
+        // >&2 is shorthand for 1>&2
+        assert_eq!(decision_for("ls -la >&2"), Decision::Allow);
+    }
+
+    #[test]
+    fn fd_close_2() {
+        // 2>&- closes stderr
+        assert_eq!(decision_for("ls -la 2>&-"), Decision::Allow);
+    }
+
+    #[test]
+    fn fd_dup_with_real_redir() {
+        // 2>&1 is fine but > file is still mutation
+        assert_eq!(decision_for("ls -la > /tmp/out 2>&1"), Decision::Ask);
+    }
+
+    #[test]
+    fn fd_dup_cargo_test() {
+        // Common pattern: cargo test 2>&1 | rg FAILED
+        assert_eq!(
+            decision_for("cargo test 2>&1 | rg FAILED"),
+            Decision::Allow
+        );
+    }
+
     // ── DENY ──
 
     #[test]
@@ -1188,16 +1415,105 @@ mod tests {
         assert_eq!(decision_for("eza | unknown-tool"), Decision::Ask);
     }
 
-    // ── Substitution ──
+    // ── Substitution (recursive evaluation) ──
 
     #[test]
-    fn subst_dollar_paren() {
+    fn subst_both_allowed() {
+        // ls is ALLOW, which is ALLOW → overall ALLOW
+        assert_eq!(decision_for("ls $(which cargo)"), Decision::Allow);
+    }
+
+    #[test]
+    fn subst_both_allowed_bat_fd() {
+        assert_eq!(decision_for("bat $(fd '*.rs' src/)"), Decision::Allow);
+    }
+
+    #[test]
+    fn subst_inner_ask() {
+        // ls is ALLOW, rm is ASK → overall ASK
+        assert_eq!(decision_for("ls $(rm -rf /tmp)"), Decision::Ask);
+    }
+
+    #[test]
+    fn subst_inner_deny() {
+        // ls is ALLOW, shred is DENY → overall DENY
+        assert_eq!(decision_for("ls $(shred foo)"), Decision::Deny);
+    }
+
+    #[test]
+    fn subst_outer_unrecognized() {
+        // echo is unrecognized (ASK), cat is unrecognized (ASK)
         assert_eq!(decision_for("echo $(cat /etc/passwd)"), Decision::Ask);
     }
 
     #[test]
-    fn subst_backtick() {
+    fn subst_backtick_unrecognized() {
+        // echo is unrecognized (ASK), whoami is unrecognized (ASK)
         assert_eq!(decision_for("echo `whoami`"), Decision::Ask);
+    }
+
+    #[test]
+    fn subst_nested() {
+        // Inner: cat $(which foo) → which is ALLOW, cat is unrecognized (ASK)
+        // Outer: ls __SUBST__ → ALLOW
+        // Overall: ASK
+        assert_eq!(decision_for("ls $(cat $(which foo))"), Decision::Ask);
+    }
+
+    #[test]
+    fn subst_single_quoted_not_expanded() {
+        // Single quotes prevent substitution extraction
+        // echo is unrecognized → ASK, but NOT because of subst
+        assert_eq!(decision_for("echo '$(rm -rf /)'"), Decision::Ask);
+        let r = reason_for("echo '$(rm -rf /)'");
+        assert!(
+            r.contains("unrecognized"),
+            "should be unrecognized (single quotes block subst): {r}"
+        );
+    }
+
+    #[test]
+    fn subst_double_quoted_expanded() {
+        // Double quotes do NOT block $() expansion
+        // Inner: rm -rf / → ASK
+        assert_eq!(decision_for("echo \"$(rm -rf /)\""), Decision::Ask);
+        let r = reason_for("echo \"$(rm -rf /)\"");
+        assert!(
+            r.contains("subst"),
+            "should show substitution evaluation: {r}"
+        );
+    }
+
+    #[test]
+    fn subst_process_subst_no_false_redir() {
+        // Process substitution >() should NOT trigger output redirection detection
+        // diff is unrecognized (ASK), sort is unrecognized (ASK)
+        assert_eq!(decision_for("diff <(sort a) <(sort b)"), Decision::Ask);
+        let r = reason_for("diff <(sort a) <(sort b)");
+        assert!(
+            !r.contains("redirection"),
+            "process substitution should not trigger redirection: {r}"
+        );
+    }
+
+    #[test]
+    fn subst_in_compound_allow() {
+        // ls $(which cargo) && bat $(fd '*.rs')
+        // All parts and substitutions are ALLOW
+        assert_eq!(
+            decision_for("ls $(which cargo) && bat $(fd '*.rs')"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn subst_in_compound_deny() {
+        // ls $(shred foo) && bat README.md
+        // Inner shred is DENY → overall DENY
+        assert_eq!(
+            decision_for("ls $(shred foo) && bat README.md"),
+            Decision::Deny
+        );
     }
 
     // ── Quoting ──
