@@ -63,14 +63,6 @@ impl CommandRegistry {
             return spec.evaluate(&ctx);
         }
 
-        // Universal --version on short invocations (to be removed in Phase 5)
-        if ctx.words.len() <= 3 && ctx.has_flag("--version") {
-            return RuleMatch {
-                decision: Decision::Allow,
-                reason: format!("{} --version", ctx.base_command),
-            };
-        }
-
         // Fallthrough → ask
         RuleMatch {
             decision: Decision::Ask,

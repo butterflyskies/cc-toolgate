@@ -196,8 +196,9 @@ mod tests {
     }
 
     #[test]
-    fn allow_generic_version() {
-        assert_eq!(decision_for("rustc --version"), Decision::Allow);
+    fn ask_unrecognized_version() {
+        // No universal --version rule: unrecognized commands with --version → ASK
+        assert_eq!(decision_for("rustc --version"), Decision::Ask);
     }
 
     #[test]
