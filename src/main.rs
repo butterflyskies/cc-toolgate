@@ -13,6 +13,7 @@
 
 use serde::Deserialize;
 use std::io::Read;
+use std::io::Write;
 
 // ─── Types ───────────────────────────────────────────
 
@@ -537,10 +538,42 @@ const DENY_COMMANDS: &[&str] = &[
 const ASK_COMMANDS: &[&str] = &[
     "rm", "rmdir",  // destructive but sometimes needed
     "sudo", "su", "doas", "pkexec", // privilege escalation
+    "mkdir", "touch", // create files/dirs
+    "mv", "cp", "ln", // move/copy/link
+    "chmod", "chown", "chgrp", // permission changes
+    "tee",  // writes to files (even though it also outputs to stdout)
+    "curl", "wget", // network access
+    "pip", "pip3", "npm", "npx", "yarn", "pnpm", // package managers
+    "python", "python3", "node", "ruby", "perl", // interpreters (can do anything)
+    "make", "cmake", "ninja", // build systems
 ];
 
 const ALLOW_COMMANDS: &[&str] = &[
-    "ls", "tree", "which", "cd", "chdir",
+    "ls", "tree", "which", "cd", "chdir", "pwd",
+    // File reading (redirection caught separately)
+    "cat", "head", "tail", "less", "more",
+    // Text output
+    "echo", "printf",
+    // Text processing (read-only to stdout; redirection caught separately)
+    "grep", "sort", "uniq", "diff", "comm", "tr", "cut", "rev", "wc",
+    "column", "paste", "expand", "unexpand", "fold", "fmt", "nl",
+    // File/path info
+    "stat", "file", "dirname", "basename", "realpath", "readlink",
+    // System info
+    "uname", "hostname", "id", "whoami", "groups", "nproc",
+    "uptime", "arch", "date", "free", "df", "du", "lsblk",
+    // Environment
+    "env", "printenv", "locale",
+    // Shell builtins / control
+    "test", "[", "true", "false", "type", "command", "hash",
+    "export", "unset", "set", "source", ".",
+    "sleep", "seq", "yes",
+    // Process inspection
+    "ps", "top", "htop", "pgrep",
+    // Directory listing (find is read-only; redirection caught separately)
+    "find",
+    // Misc safe
+    "xargs", "clear", "tput", "reset",
     // Rust-based CLI tools (deployed on ai-dev container)
     "eza",       // ls replacement
     "bat",       // cat replacement
@@ -639,6 +672,18 @@ fn evaluate_single(command: &str) -> RuleMatch {
         return RuleMatch {
             decision: Decision::Deny,
             reason: format!("blocked command: {base}"),
+        };
+    }
+
+    // ── --version on any non-denied command (short invocations) ──
+    // Only --version is universal. -V means different things in different tools
+    // (e.g. tar -V is --verbose). -V is handled per-tool where known safe.
+    if cmd.split_whitespace().count() <= 3
+        && cmd.split_whitespace().any(|w| w == "--version")
+    {
+        return RuleMatch {
+            decision: Decision::Allow,
+            reason: format!("{base} --version"),
         };
     }
 
@@ -826,18 +871,6 @@ fn evaluate_single(command: &str) -> RuleMatch {
         };
     }
 
-    // ── --version flag on any command (short invocations only) ──
-    {
-        if cmd.split_whitespace().count() <= 3
-            && cmd.split_whitespace().any(|w| w == "--version" || w == "-V")
-        {
-            return RuleMatch {
-                decision: Decision::Allow,
-                reason: format!("{base} --version"),
-            };
-        }
-    }
-
     // ── Fallthrough → ask ──
     RuleMatch {
         decision: Decision::Ask,
@@ -921,6 +954,77 @@ fn evaluate(command: &str) -> RuleMatch {
     }
 }
 
+// ─── Logging ─────────────────────────────────────────
+
+/// Append a decision record to ~/.local/share/cc-toolgate/decisions.log.
+/// Best-effort: failures are silently ignored (logging must never block the hook).
+fn log_decision(command: &str, result: &RuleMatch) {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let log_dir = std::path::Path::new(&home)
+        .join(".local/share/cc-toolgate");
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let log_path = log_dir.join("decisions.log");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    else {
+        return;
+    };
+
+    // Compact single-line reason for the log (replace newlines with "; ")
+    let reason_oneline = result.reason.replace('\n', "; ");
+    let cmd_truncated: String = command.chars().take(200).collect();
+    let ts = timestamp_now();
+
+    let _ = writeln!(
+        file,
+        "{ts}\t{decision}\t{cmd}\t{reason}",
+        decision = result.decision.as_str(),
+        cmd = cmd_truncated,
+        reason = reason_oneline,
+    );
+}
+
+/// Simple UTC timestamp without external deps.
+fn timestamp_now() -> String {
+    // Read /proc/self/stat for uptime would be overkill.
+    // Use SystemTime for a basic ISO-ish timestamp.
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+    // Convert to rough UTC: days/hours/mins/secs
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let h = rem / 3600;
+    let m = (rem % 3600) / 60;
+    let s = rem % 60;
+    // Days since epoch → approximate date (good enough for log ordering)
+    // 2000-01-01 = day 10957 from epoch
+    let (year, month, day) = epoch_days_to_date(days);
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+fn epoch_days_to_date(days: u64) -> (u64, u64, u64) {
+    // Civil calendar from days algorithm (Howard Hinnant)
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
 // ─── Entry point ─────────────────────────────────────
 
 fn main() {
@@ -952,6 +1056,9 @@ fn main() {
     }
 
     let result = evaluate(&command);
+
+    // Log decision to ~/.local/share/cc-toolgate/decisions.log
+    log_decision(&command, &result);
 
     let output = serde_json::json!({
         "hookSpecificOutput": {
@@ -1108,8 +1215,225 @@ mod tests {
     }
 
     #[test]
-    fn allow_generic_version_short() {
-        assert_eq!(decision_for("node -V"), Decision::Allow);
+    fn ask_ambiguous_short_v_flag() {
+        // -V is NOT universally --version (e.g. tar -V = --verbose)
+        // node is in ASK_COMMANDS, and -V alone doesn't auto-allow
+        assert_eq!(decision_for("node -V"), Decision::Ask);
+    }
+
+    // ── New ALLOW: read-only commands ──
+
+    #[test]
+    fn allow_cat() {
+        assert_eq!(decision_for("cat README.md"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_head() {
+        assert_eq!(decision_for("head -20 src/main.rs"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_tail() {
+        assert_eq!(decision_for("tail -f /var/log/syslog"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_echo() {
+        assert_eq!(decision_for("echo hello world"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_printf() {
+        assert_eq!(decision_for("printf '%s\\n' hello"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_grep() {
+        assert_eq!(decision_for("grep -r 'pattern' src/"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_wc() {
+        assert_eq!(decision_for("wc -l src/main.rs"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_sort() {
+        assert_eq!(decision_for("sort /tmp/data.txt"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_diff() {
+        assert_eq!(decision_for("diff a.txt b.txt"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_find() {
+        assert_eq!(decision_for("find . -name '*.rs'"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_pwd() {
+        assert_eq!(decision_for("pwd"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_env() {
+        assert_eq!(decision_for("env"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_uname() {
+        assert_eq!(decision_for("uname -a"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_id() {
+        assert_eq!(decision_for("id"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_whoami() {
+        assert_eq!(decision_for("whoami"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_stat() {
+        assert_eq!(decision_for("stat /tmp"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_realpath() {
+        assert_eq!(decision_for("realpath ./src"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_date() {
+        assert_eq!(decision_for("date +%Y-%m-%d"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_df() {
+        assert_eq!(decision_for("df -h"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_du() {
+        assert_eq!(decision_for("du -sh ."), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_sleep() {
+        assert_eq!(decision_for("sleep 1"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_ps() {
+        assert_eq!(decision_for("ps aux"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_xargs() {
+        assert_eq!(decision_for("xargs echo"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_test_bracket() {
+        assert_eq!(decision_for("test -f /tmp/foo"), Decision::Allow);
+    }
+
+    // ── New ASK: mutating but needed ──
+
+    #[test]
+    fn ask_mkdir() {
+        assert_eq!(decision_for("mkdir -p /tmp/new"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_touch() {
+        assert_eq!(decision_for("touch /tmp/newfile"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_mv() {
+        assert_eq!(decision_for("mv old.txt new.txt"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_cp() {
+        assert_eq!(decision_for("cp src.txt dst.txt"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_ln() {
+        assert_eq!(decision_for("ln -s target link"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_chmod() {
+        assert_eq!(decision_for("chmod 755 script.sh"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_tee() {
+        assert_eq!(decision_for("tee /tmp/out.txt"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_curl() {
+        assert_eq!(decision_for("curl https://example.com"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_wget() {
+        assert_eq!(decision_for("wget https://example.com/file"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_pip_install() {
+        assert_eq!(decision_for("pip install requests"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_npm_install() {
+        assert_eq!(decision_for("npm install express"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_python() {
+        assert_eq!(decision_for("python3 script.py"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_make() {
+        assert_eq!(decision_for("make -j4"), Decision::Ask);
+    }
+
+    // ── Compound: new allow commands in pipelines ──
+
+    #[test]
+    fn pipe_cat_grep_wc() {
+        assert_eq!(
+            decision_for("cat src/main.rs | grep 'fn ' | wc -l"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn pipe_find_xargs_grep() {
+        assert_eq!(
+            decision_for("find . -name '*.rs' | xargs grep 'TODO'"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn chain_echo_and_cat() {
+        assert_eq!(
+            decision_for("echo 'checking...' && cat README.md"),
+            Decision::Allow
+        );
     }
 
     // ── ASK ──
@@ -1441,35 +1765,30 @@ mod tests {
     }
 
     #[test]
-    fn subst_outer_unrecognized() {
-        // echo is unrecognized (ASK), cat is unrecognized (ASK)
-        assert_eq!(decision_for("echo $(cat /etc/passwd)"), Decision::Ask);
+    fn subst_all_allowed() {
+        // echo is ALLOW, cat is ALLOW → overall ALLOW
+        assert_eq!(decision_for("echo $(cat /etc/passwd)"), Decision::Allow);
     }
 
     #[test]
-    fn subst_backtick_unrecognized() {
-        // echo is unrecognized (ASK), whoami is unrecognized (ASK)
-        assert_eq!(decision_for("echo `whoami`"), Decision::Ask);
+    fn subst_backtick_all_allowed() {
+        // echo is ALLOW, whoami is ALLOW → overall ALLOW
+        assert_eq!(decision_for("echo `whoami`"), Decision::Allow);
     }
 
     #[test]
-    fn subst_nested() {
-        // Inner: cat $(which foo) → which is ALLOW, cat is unrecognized (ASK)
+    fn subst_nested_all_allowed() {
+        // Inner: cat $(which foo) → which is ALLOW, cat is ALLOW
         // Outer: ls __SUBST__ → ALLOW
-        // Overall: ASK
-        assert_eq!(decision_for("ls $(cat $(which foo))"), Decision::Ask);
+        // Overall: ALLOW
+        assert_eq!(decision_for("ls $(cat $(which foo))"), Decision::Allow);
     }
 
     #[test]
     fn subst_single_quoted_not_expanded() {
         // Single quotes prevent substitution extraction
-        // echo is unrecognized → ASK, but NOT because of subst
-        assert_eq!(decision_for("echo '$(rm -rf /)'"), Decision::Ask);
-        let r = reason_for("echo '$(rm -rf /)'");
-        assert!(
-            r.contains("unrecognized"),
-            "should be unrecognized (single quotes block subst): {r}"
-        );
+        // echo is ALLOW, no subst extracted → ALLOW
+        assert_eq!(decision_for("echo '$(rm -rf /)'"), Decision::Allow);
     }
 
     #[test]
@@ -1487,13 +1806,8 @@ mod tests {
     #[test]
     fn subst_process_subst_no_false_redir() {
         // Process substitution >() should NOT trigger output redirection detection
-        // diff is unrecognized (ASK), sort is unrecognized (ASK)
-        assert_eq!(decision_for("diff <(sort a) <(sort b)"), Decision::Ask);
-        let r = reason_for("diff <(sort a) <(sort b)");
-        assert!(
-            !r.contains("redirection"),
-            "process substitution should not trigger redirection: {r}"
-        );
+        // diff is ALLOW, sort is ALLOW → overall ALLOW
+        assert_eq!(decision_for("diff <(sort a) <(sort b)"), Decision::Allow);
     }
 
     #[test]
@@ -1520,24 +1834,14 @@ mod tests {
 
     #[test]
     fn quoted_redirect_single() {
-        // > inside single quotes is NOT real redirection; echo itself is unrecognized → ask
-        assert_eq!(decision_for("echo 'hello > world'"), Decision::Ask);
-        let r = reason_for("echo 'hello > world'");
-        assert!(
-            r.contains("unrecognized"),
-            "should be unrecognized, not redirection: {r}"
-        );
+        // > inside single quotes is NOT real redirection; echo is now ALLOW
+        assert_eq!(decision_for("echo 'hello > world'"), Decision::Allow);
     }
 
     #[test]
     fn quoted_chain_double() {
-        // && inside double quotes should NOT split
-        assert_eq!(decision_for("echo \"a && b\""), Decision::Ask);
-        let r = reason_for("echo \"a && b\"");
-        assert!(
-            r.contains("unrecognized"),
-            "should be a single command, not compound: {r}"
-        );
+        // && inside double quotes should NOT split; echo is now ALLOW
+        assert_eq!(decision_for("echo \"a && b\""), Decision::Allow);
     }
 
     // ── Cargo compound ──
