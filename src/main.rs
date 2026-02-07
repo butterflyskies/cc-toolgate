@@ -137,40 +137,33 @@ mod tests {
     }
 
     #[test]
-    fn allow_git_push_with_config() {
-        assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push origin main"),
-            Decision::Allow
-        );
-    }
-
-    #[test]
-    fn allow_git_pull_with_config() {
-        assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git pull origin main"),
-            Decision::Allow
-        );
-    }
-
-    #[test]
     fn allow_git_status() {
         assert_eq!(decision_for("git status"), Decision::Allow);
     }
 
     #[test]
-    fn allow_git_status_with_config() {
+    fn ask_git_push() {
+        // Default config has no env-gated commands — push always asks
+        assert_eq!(decision_for("git push origin main"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_git_push_with_env() {
+        // Default config has empty config_env_var — env var doesn't help
         assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git status"),
-            Decision::Allow
+            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push origin main"),
+            Decision::Ask
         );
     }
 
     #[test]
-    fn allow_git_add_with_config() {
-        assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git add ."),
-            Decision::Allow
-        );
+    fn ask_git_pull() {
+        assert_eq!(decision_for("git pull origin main"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_git_add() {
+        assert_eq!(decision_for("git add ."), Decision::Ask);
     }
 
     #[test]
@@ -464,19 +457,9 @@ mod tests {
     }
 
     #[test]
-    fn ask_git_push_no_config() {
-        assert_eq!(decision_for("git push origin main"), Decision::Ask);
-    }
-
-    #[test]
-    fn ask_git_pull_no_config() {
-        assert_eq!(decision_for("git pull origin main"), Decision::Ask);
-    }
-
-    #[test]
     fn ask_force_push() {
         assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push --force origin main"),
+            decision_for("git push --force origin main"),
             Decision::Ask
         );
     }
@@ -484,7 +467,7 @@ mod tests {
     #[test]
     fn ask_force_push_short_flag() {
         assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push -f origin main"),
+            decision_for("git push -f origin main"),
             Decision::Ask
         );
     }
@@ -492,19 +475,14 @@ mod tests {
     #[test]
     fn ask_force_push_with_lease() {
         assert_eq!(
-            decision_for(
-                "GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push --force-with-lease origin main"
-            ),
+            decision_for("git push --force-with-lease origin main"),
             Decision::Ask
         );
     }
 
     #[test]
     fn ask_git_commit() {
-        assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git commit -m 'test'"),
-            Decision::Ask
-        );
+        assert_eq!(decision_for("git commit -m 'test'"), Decision::Ask);
     }
 
     #[test]
@@ -572,10 +550,7 @@ mod tests {
 
     #[test]
     fn redir_git_status() {
-        assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git status > /tmp/s.txt"),
-            Decision::Ask
-        );
+        assert_eq!(decision_for("git status > /tmp/s.txt"), Decision::Ask);
     }
 
     #[test]
@@ -1077,7 +1052,7 @@ mod tests {
 
     #[test]
     fn heredoc_git_commit_with_body() {
-        let cmd = "GIT_CONFIG_GLOBAL=~/.gitconfig.ai git commit -m \"$(cat <<'EOF'\nFix bug in `parse/shell.rs`\n\nCo-Authored-By: Claude\nEOF\n)\"";
+        let cmd = "git commit -m \"$(cat <<'EOF'\nFix bug in `parse/shell.rs`\n\nCo-Authored-By: Claude\nEOF\n)\"";
         assert_eq!(decision_for(cmd), Decision::Ask);
         let r = reason_for(cmd);
         assert!(

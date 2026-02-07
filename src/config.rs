@@ -41,6 +41,10 @@ pub struct GitConfig {
     pub read_only: Vec<String>,
     #[serde(default)]
     pub allowed_with_config: Vec<String>,
+    /// Env var that must be set for `allowed_with_config` commands to auto-allow.
+    /// When empty, those commands fall through to ASK.
+    #[serde(default)]
+    pub config_env_var: String,
     #[serde(default)]
     pub force_push_flags: Vec<String>,
 }
@@ -129,6 +133,13 @@ mod tests {
     fn default_escalate_deny_is_false() {
         let config = Config::default_config();
         assert!(!config.settings.escalate_deny);
+    }
+
+    #[test]
+    fn default_git_env_gate_disabled() {
+        let config = Config::default_config();
+        assert!(config.git.config_env_var.is_empty());
+        assert!(config.git.allowed_with_config.is_empty());
     }
 
     #[test]

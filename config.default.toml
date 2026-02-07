@@ -76,8 +76,15 @@ read_only = [
     "blame", "describe", "stash",
 ]
 
-# Subcommands auto-allowed only with GIT_CONFIG_GLOBAL set.
-allowed_with_config = ["push", "pull", "add"]
+# Subcommands auto-allowed only when `config_env_var` is present.
+# Empty by default — enable in your custom config if you use a separate
+# AI gitconfig (e.g. GIT_CONFIG_GLOBAL=~/.gitconfig.ai).
+#
+# Example custom config to enable:
+#   allowed_with_config = ["push", "pull", "add"]
+#   config_env_var = "GIT_CONFIG_GLOBAL"
+allowed_with_config = []
+config_env_var = ""
 
 # Flags that escalate push to ASK regardless of config.
 force_push_flags = ["--force", "--force-with-lease", "-f"]
