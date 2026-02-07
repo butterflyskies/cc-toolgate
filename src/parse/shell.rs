@@ -434,10 +434,49 @@ fn extract_substitutions(command: &str) -> (String, Vec<String>) {
     (outer, inners)
 }
 
+/// Skip past `>` or `>>` and any whitespace, then collect the unquoted target word.
+/// Returns the target path (e.g. "/dev/null", "file.txt") or empty string if nothing follows.
+fn extract_redir_target(chars: &[char], start: usize) -> String {
+    let len = chars.len();
+    let mut i = start;
+    // Skip past > or >>
+    if i < len && chars[i] == '>' {
+        i += 1;
+    }
+    if i < len && chars[i] == '>' {
+        i += 1; // >>
+    }
+    // Skip whitespace
+    while i < len && (chars[i] == ' ' || chars[i] == '\t') {
+        i += 1;
+    }
+    // Collect target word (unquoted for now — sufficient for /dev/null detection)
+    let mut target = String::new();
+    while i < len && !chars[i].is_whitespace() && chars[i] != ';' && chars[i] != '|' && chars[i] != '&' {
+        target.push(chars[i]);
+        i += 1;
+    }
+    target
+}
+
+/// Returns true if an fd number (0-9) refers to a standard stream (stdin/stdout/stderr).
+/// Custom fd numbers (3+) are NOT considered safe for duplication targets because they
+/// could have been redirected to files earlier in the same compound command
+/// (e.g. `exec 3>/tmp/evil && cmd >&3`).
+fn is_standard_fd(c: char) -> bool {
+    c == '0' || c == '1' || c == '2'
+}
+
 /// Detect output redirection (>, >>, &>, fd>) outside quotes.
 /// Does NOT flag:
 ///   - Input redirection (<) or here-docs (<<, <<<)
-///   - fd-to-fd duplication: >&N, N>&M, >&-, N>&- (e.g. 2>&1)
+///   - Redirection to /dev/null (discarding output is not mutating)
+///   - fd-to-fd duplication to standard streams: >&1, >&2, N>&1, N>&2
+///   - fd closing: >&-, N>&-
+///
+/// DOES flag (conservatively):
+///   - >&N where N >= 3 (custom fds could point to files)
+///   - N>&M where M >= 3 (same reason)
 pub fn has_output_redirection(command: &str) -> Option<Redirection> {
     let chars: Vec<char> = command.chars().collect();
     let len = chars.len();
@@ -472,8 +511,14 @@ pub fn has_output_redirection(command: &str) -> Option<Redirection> {
             continue;
         }
 
-        // &> or &>> (redirect both stdout+stderr to file — always mutation)
+        // &> or &>> (redirect both stdout+stderr to file)
         if c == '&' && i + 1 < len && chars[i + 1] == '>' {
+            let target = extract_redir_target(&chars, i + 1);
+            if target == "/dev/null" {
+                // Skip past &> /dev/null
+                i += 2;
+                continue;
+            }
             return Some(Redirection {
                 description: "output redirection (&>)".into(),
             });
@@ -481,13 +526,33 @@ pub fn has_output_redirection(command: &str) -> Option<Redirection> {
 
         // fd redirects: N>, N>>, N>&M, N>&-
         if c.is_ascii_digit() && i + 1 < len && chars[i + 1] == '>' {
-            // N>&M or N>&- is fd duplication/closing, not file output
+            // N>&- is fd closing — always safe
             if i + 2 < len
                 && chars[i + 2] == '&'
                 && i + 3 < len
-                && (chars[i + 3].is_ascii_digit() || chars[i + 3] == '-')
+                && chars[i + 3] == '-'
             {
                 i += 4;
+                continue;
+            }
+            // N>&M — safe only when M is a standard fd (0-2)
+            if i + 2 < len
+                && chars[i + 2] == '&'
+                && i + 3 < len
+                && chars[i + 3].is_ascii_digit()
+            {
+                if is_standard_fd(chars[i + 3]) {
+                    i += 4;
+                    continue;
+                }
+                return Some(Redirection {
+                    description: format!("output redirection ({c}>&{}, custom fd target)", chars[i + 3]),
+                });
+            }
+            // N> file or N>> file — check for /dev/null
+            let target = extract_redir_target(&chars, i + 1);
+            if target == "/dev/null" {
+                i += 2;
                 continue;
             }
             return Some(Redirection {
@@ -501,13 +566,33 @@ pub fn has_output_redirection(command: &str) -> Option<Redirection> {
                 i += 1;
                 continue;
             }
-            // >&N or >&- is fd duplication/closing
+            // >&- is fd closing — always safe
             if i + 1 < len
                 && chars[i + 1] == '&'
                 && i + 2 < len
-                && (chars[i + 2].is_ascii_digit() || chars[i + 2] == '-')
+                && chars[i + 2] == '-'
             {
                 i += 3;
+                continue;
+            }
+            // >&N — safe only when N is a standard fd (0-2)
+            if i + 1 < len
+                && chars[i + 1] == '&'
+                && i + 2 < len
+                && chars[i + 2].is_ascii_digit()
+            {
+                if is_standard_fd(chars[i + 2]) {
+                    i += 3;
+                    continue;
+                }
+                return Some(Redirection {
+                    description: format!("output redirection (>&{}, custom fd target)", chars[i + 2]),
+                });
+            }
+            // > file or >> file — check for /dev/null
+            let target = extract_redir_target(&chars, i);
+            if target == "/dev/null" {
+                i += 1;
                 continue;
             }
             return Some(Redirection {
@@ -684,8 +769,13 @@ mod tests {
     }
 
     #[test]
-    fn no_redir_fd_dup() {
+    fn no_redir_fd_dup_stderr_to_stdout() {
         assert!(has_output_redirection("cmd 2>&1").is_none());
+    }
+
+    #[test]
+    fn no_redir_fd_dup_stdout_to_stderr() {
+        assert!(has_output_redirection("cmd 1>&2").is_none());
     }
 
     #[test]
@@ -694,8 +784,13 @@ mod tests {
     }
 
     #[test]
-    fn no_redir_bare_dup() {
+    fn no_redir_bare_dup_to_stderr() {
         assert!(has_output_redirection("cmd >&2").is_none());
+    }
+
+    #[test]
+    fn no_redir_bare_close() {
+        assert!(has_output_redirection("cmd >&-").is_none());
     }
 
     #[test]
@@ -706,6 +801,54 @@ mod tests {
     #[test]
     fn no_redir_quoted() {
         assert!(has_output_redirection("echo 'hello > world'").is_none());
+    }
+
+    // ── /dev/null is non-mutating ──
+
+    #[test]
+    fn no_redir_devnull() {
+        assert!(has_output_redirection("cmd > /dev/null").is_none());
+    }
+
+    #[test]
+    fn no_redir_devnull_append() {
+        assert!(has_output_redirection("cmd >> /dev/null").is_none());
+    }
+
+    #[test]
+    fn no_redir_devnull_stderr() {
+        assert!(has_output_redirection("cmd 2> /dev/null").is_none());
+    }
+
+    #[test]
+    fn no_redir_devnull_ampersand() {
+        assert!(has_output_redirection("cmd &> /dev/null").is_none());
+    }
+
+    #[test]
+    fn redir_devnull_plus_file() {
+        // /dev/null for stderr is fine, but > file is still mutation
+        assert!(has_output_redirection("cmd > /tmp/out 2> /dev/null").is_some());
+    }
+
+    // ── Custom fd targets are suspicious ──
+
+    #[test]
+    fn redir_custom_fd_dup_target() {
+        // >&3 could be writing to a file if fd 3 was opened earlier
+        assert!(has_output_redirection("cmd >&3").is_some());
+    }
+
+    #[test]
+    fn redir_custom_fd_dup_numbered() {
+        // 2>&3 — fd 3 could be a file
+        assert!(has_output_redirection("cmd 2>&3").is_some());
+    }
+
+    #[test]
+    fn no_redir_standard_fd_dup() {
+        // >&1 is always safe (stdout to stdout)
+        assert!(has_output_redirection("cmd >&1").is_none());
     }
 
     // ── Heredoc parsing ──

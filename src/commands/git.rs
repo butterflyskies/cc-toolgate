@@ -19,15 +19,41 @@ impl GitSpec {
         }
     }
 
+    /// Global git flags that consume the next word as their argument.
+    /// These appear before the subcommand: `git -C /path status`.
+    const GLOBAL_ARG_FLAGS: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace"];
+
+    /// Global git flags that are standalone (no argument consumed).
+    const GLOBAL_SOLO_FLAGS: &[&str] = &[
+        "--bare", "--no-pager", "--no-replace-objects",
+        "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs",
+        "--icase-pathspecs", "--no-optional-locks",
+    ];
+
     /// Extract the git subcommand word (e.g. "push" from "git push origin main").
+    /// Skips global flags like `-C <path>` that appear before the subcommand.
     fn subcommand(ctx: &CommandContext) -> Option<String> {
         let mut iter = ctx.words.iter();
+        // Advance past env vars to find "git"
         for word in iter.by_ref() {
             if word == "git" {
-                return iter.next().cloned();
+                break;
             }
         }
-        None
+        // Skip global flags to find the subcommand
+        loop {
+            let word = iter.next()?;
+            if Self::GLOBAL_ARG_FLAGS.contains(&word.as_str()) {
+                // Consume the flag's argument
+                iter.next();
+                continue;
+            }
+            if Self::GLOBAL_SOLO_FLAGS.contains(&word.as_str()) {
+                continue;
+            }
+            // Not a global flag — this is the subcommand
+            return Some(word.clone());
+        }
     }
 }
 
@@ -199,5 +225,38 @@ mod tests {
             eval_with_env_gate("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git commit -m 'test'"),
             Decision::Ask
         );
+    }
+
+    // ── Global flag skipping (-C, -c, etc.) ──
+
+    #[test]
+    fn allow_git_c_dir_status() {
+        assert_eq!(eval("git -C /some/path status"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_git_c_dir_log() {
+        assert_eq!(eval("git -C /some/repo log --oneline"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_git_c_dir_diff() {
+        assert_eq!(eval("git -C ../other diff"), Decision::Allow);
+    }
+
+    #[test]
+    fn ask_git_c_dir_push() {
+        assert_eq!(eval("git -C /some/repo push origin main"), Decision::Ask);
+    }
+
+    #[test]
+    fn allow_git_no_pager_log() {
+        assert_eq!(eval("git --no-pager log"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_git_c_config_status() {
+        // -c key=value is also a global flag
+        assert_eq!(eval("git -c core.pager=cat status"), Decision::Allow);
     }
 }

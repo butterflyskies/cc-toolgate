@@ -873,6 +873,32 @@ mod tests {
         assert_eq!(decision_for("git log > /tmp/log.txt"), Decision::Ask);
     }
 
+    // ── git -C (change directory) ──
+
+    #[test]
+    fn allow_git_c_status() {
+        assert_eq!(
+            decision_for("git -C /var/home/user/repo status"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn allow_git_c_log() {
+        assert_eq!(
+            decision_for("git -C ../other-repo log --oneline -5"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn ask_git_c_push() {
+        assert_eq!(
+            decision_for("git -C /some/repo push origin main"),
+            Decision::Ask
+        );
+    }
+
     // ── gh CLI read-only ──
 
     #[test]
@@ -1063,6 +1089,68 @@ mod tests {
             !r.contains("unrecognized command"),
             "heredoc body should not produce unrecognized commands: {r}"
         );
+    }
+
+    // ── /dev/null redirection (non-mutating) ──
+
+    #[test]
+    fn allow_ls_devnull() {
+        assert_eq!(decision_for("ls -la > /dev/null"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_ls_devnull_stderr() {
+        assert_eq!(decision_for("ls -la 2> /dev/null"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_ls_devnull_combined() {
+        assert_eq!(decision_for("ls -la &> /dev/null"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_cargo_test_devnull() {
+        assert_eq!(
+            decision_for("cargo test 2> /dev/null"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn allow_git_status_devnull() {
+        assert_eq!(
+            decision_for("git status > /dev/null"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn ask_ls_devnull_plus_file() {
+        // stdout to file AND stderr to /dev/null — still mutating
+        assert_eq!(
+            decision_for("ls -la > /tmp/out 2> /dev/null"),
+            Decision::Ask
+        );
+    }
+
+    // ── Custom fd duplication safety ──
+
+    #[test]
+    fn fd_dup_to_custom_fd_asks() {
+        // >&3 could write to a file — not safe
+        assert_eq!(decision_for("ls -la >&3"), Decision::Ask);
+    }
+
+    #[test]
+    fn fd_dup_stderr_to_custom_fd_asks() {
+        // 2>&3 could write to a file
+        assert_eq!(decision_for("ls -la 2>&3"), Decision::Ask);
+    }
+
+    #[test]
+    fn fd_dup_to_standard_fd_allows() {
+        // >&2 is always safe
+        assert_eq!(decision_for("ls -la >&2"), Decision::Allow);
     }
 
     #[test]

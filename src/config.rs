@@ -53,6 +53,12 @@ pub struct GitConfig {
 pub struct CargoConfig {
     #[serde(default)]
     pub safe_subcommands: Vec<String>,
+    /// Subcommands auto-allowed only when `config_env_var` is present.
+    #[serde(default)]
+    pub allowed_with_config: Vec<String>,
+    /// Env var that must be set for `allowed_with_config` commands to auto-allow.
+    #[serde(default)]
+    pub config_env_var: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -61,6 +67,12 @@ pub struct KubectlConfig {
     pub read_only: Vec<String>,
     #[serde(default)]
     pub mutating: Vec<String>,
+    /// Subcommands auto-allowed only when `config_env_var` is present.
+    #[serde(default)]
+    pub allowed_with_config: Vec<String>,
+    /// Env var that must be set for `allowed_with_config` commands to auto-allow.
+    #[serde(default)]
+    pub config_env_var: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -69,6 +81,12 @@ pub struct GhConfig {
     pub read_only: Vec<String>,
     #[serde(default)]
     pub mutating: Vec<String>,
+    /// Subcommands auto-allowed only when `config_env_var` is present.
+    #[serde(default)]
+    pub allowed_with_config: Vec<String>,
+    /// Env var that must be set for `allowed_with_config` commands to auto-allow.
+    #[serde(default)]
+    pub config_env_var: String,
 }
 
 impl Config {

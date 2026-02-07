@@ -98,6 +98,12 @@ safe_subcommands = [
     "verify-project", "search", "generate-lockfile",
 ]
 
+# Subcommands auto-allowed only when `config_env_var` is present.
+# Example: allowed_with_config = ["install"]
+#          config_env_var = "CARGO_INSTALL_ROOT"
+allowed_with_config = []
+config_env_var = ""
+
 [kubectl]
 read_only = [
     "get", "describe", "logs", "top", "explain",
@@ -110,6 +116,12 @@ mutating = [
     "drain", "cordon", "uncordon", "taint",
     "exec", "run", "port-forward", "cp",
 ]
+
+# Subcommands auto-allowed only when `config_env_var` is present.
+# Example: allowed_with_config = ["apply", "rollout"]
+#          config_env_var = "KUBECONFIG"
+allowed_with_config = []
+config_env_var = ""
 
 [gh]
 # Two-word subcommands (e.g. "pr list") and one-word (e.g. "status").
@@ -146,3 +158,9 @@ mutating = [
     "secret set", "secret delete",
     "config set",
 ]
+
+# Subcommands auto-allowed only when `config_env_var` is present.
+# Example: allowed_with_config = ["pr create", "pr merge"]
+#          config_env_var = "GH_TOKEN"
+allowed_with_config = []
+config_env_var = ""
