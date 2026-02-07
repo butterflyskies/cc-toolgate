@@ -1,8 +1,22 @@
 # cc-toolgate default configuration
 #
-# Copy to ~/.config/cc-toolgate/config.toml to customize.
-# Any section you include will REPLACE the defaults for that section
-# (not merge). Omit a section to keep its defaults.
+# User config at ~/.config/cc-toolgate/config.toml merges with these defaults.
+#
+# Merge behavior:
+#   - Lists: user values extend defaults (no duplicates)
+#   - Scalars: user values override defaults
+#   - remove_<field> = [...]: subtract items from default lists
+#   - replace = true: in any section, replaces defaults entirely
+#
+# Example user config (only specify what you want to change):
+#
+#   [git]
+#   allowed_with_config = ["commit", "add", "push"]
+#   config_env_var = "GIT_CONFIG_GLOBAL"
+#
+#   [commands]
+#   remove_deny = ["eval"]          # move eval from deny to ask
+#   ask = ["eval"]
 #
 # To use --escalate-deny, pass it as a CLI argument in your hook config.
 # This turns all DENY decisions into ASK, so you get prompted instead
