@@ -1,11 +1,11 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Embedded default configuration.
 const DEFAULT_CONFIG: &str = include_str!("../config.default.toml");
 
 // ── Final (merged) config types ──
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub settings: Settings,
@@ -21,13 +21,13 @@ pub struct Config {
     pub gh: GhConfig,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Settings {
     #[serde(default)]
     pub escalate_deny: bool,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Commands {
     #[serde(default)]
     pub allow: Vec<String>,
@@ -37,7 +37,7 @@ pub struct Commands {
     pub deny: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct GitConfig {
     #[serde(default)]
     pub read_only: Vec<String>,
@@ -51,7 +51,7 @@ pub struct GitConfig {
     pub force_push_flags: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct CargoConfig {
     #[serde(default)]
     pub safe_subcommands: Vec<String>,
@@ -61,7 +61,7 @@ pub struct CargoConfig {
     pub config_env_var: String,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct KubectlConfig {
     #[serde(default)]
     pub read_only: Vec<String>,
@@ -73,7 +73,7 @@ pub struct KubectlConfig {
     pub config_env_var: String,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct GhConfig {
     #[serde(default)]
     pub read_only: Vec<String>,

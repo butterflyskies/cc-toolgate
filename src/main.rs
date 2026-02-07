@@ -13,7 +13,23 @@ struct ToolInput {
 }
 
 fn main() {
-    let escalate_deny = std::env::args().any(|a| a == "--escalate-deny");
+    let args: Vec<String> = std::env::args().collect();
+    let escalate_deny = args.iter().any(|a| a == "--escalate-deny");
+
+    // --dump-config [json]: print effective config and exit
+    if let Some(pos) = args.iter().position(|a| a == "--dump-config") {
+        let config = cc_toolgate::config::Config::load();
+        let format = args.get(pos + 1).map(|s| s.as_str());
+        match format {
+            Some("json") => {
+                println!("{}", serde_json::to_string_pretty(&config).unwrap());
+            }
+            _ => {
+                println!("{}", toml::to_string_pretty(&config).unwrap());
+            }
+        }
+        return;
+    }
 
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
