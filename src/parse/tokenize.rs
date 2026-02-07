@@ -23,10 +23,12 @@ pub fn base_command(command: &str) -> String {
         }
         break;
     }
-    rest.split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string()
+    let word = rest.split_whitespace().next().unwrap_or("");
+    // Extract basename: /usr/bin/ls → ls, ./script.sh → script.sh
+    match word.rsplit_once('/') {
+        Some((_, name)) if !name.is_empty() => name.to_string(),
+        _ => word.to_string(),
+    }
 }
 
 /// Extract leading KEY=VALUE pairs from a command string.
@@ -81,6 +83,40 @@ mod tests {
     fn base_command_with_env() {
         assert_eq!(
             base_command("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push"),
+            "git"
+        );
+    }
+
+    #[test]
+    fn base_command_absolute_path() {
+        assert_eq!(base_command("/usr/bin/ls -la"), "ls");
+    }
+
+    #[test]
+    fn base_command_relative_path() {
+        assert_eq!(base_command("./script.sh --flag"), "script.sh");
+    }
+
+    #[test]
+    fn base_command_deep_path() {
+        assert_eq!(
+            base_command("/home/user/dev/cc-toolgate/target/release/cc-toolgate --dump-config"),
+            "cc-toolgate"
+        );
+    }
+
+    #[test]
+    fn base_command_tilde_path() {
+        assert_eq!(
+            base_command("~/dev/cc-toolgate/target/release/cc-toolgate --dump-config"),
+            "cc-toolgate"
+        );
+    }
+
+    #[test]
+    fn base_command_env_with_path() {
+        assert_eq!(
+            base_command("FOO=bar /usr/local/bin/git status"),
             "git"
         );
     }
