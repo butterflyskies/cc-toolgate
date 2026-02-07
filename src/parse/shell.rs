@@ -1,5 +1,119 @@
 use super::types::{Operator, ParsedPipeline, Redirection, ShellSegment};
 
+/// When `<<` is encountered at `chars[start]`, parse the heredoc delimiter
+/// and find where the body ends.
+///
+/// Returns `Some((end_pos, is_quoted))`:
+/// - `end_pos`: position after the closing delimiter line
+/// - `is_quoted`: true if delimiter was quoted (`<<'EOF'` or `<<"EOF"`), suppressing expansion
+///
+/// Returns `None` if not a valid heredoc (e.g., `<<<` here-string, missing delimiter).
+fn skip_heredoc(chars: &[char], start: usize) -> Option<(usize, bool)> {
+    let len = chars.len();
+    let mut i = start;
+
+    // Verify <<
+    if i + 1 >= len || chars[i] != '<' || chars[i + 1] != '<' {
+        return None;
+    }
+    i += 2;
+
+    // Reject <<< (here-string)
+    if i < len && chars[i] == '<' {
+        return None;
+    }
+
+    // Optional - for <<-
+    if i < len && chars[i] == '-' {
+        i += 1;
+    }
+
+    // Skip spaces/tabs before delimiter (not newlines)
+    while i < len && (chars[i] == ' ' || chars[i] == '\t') {
+        i += 1;
+    }
+
+    if i >= len || chars[i] == '\n' {
+        return None;
+    }
+
+    // Read delimiter word (possibly quoted)
+    let mut delimiter = String::new();
+    let mut is_quoted = false;
+
+    if chars[i] == '\'' {
+        is_quoted = true;
+        i += 1;
+        while i < len && chars[i] != '\'' && chars[i] != '\n' {
+            delimiter.push(chars[i]);
+            i += 1;
+        }
+        if i < len && chars[i] == '\'' {
+            i += 1;
+        }
+    } else if chars[i] == '"' {
+        is_quoted = true;
+        i += 1;
+        while i < len && chars[i] != '"' && chars[i] != '\n' {
+            delimiter.push(chars[i]);
+            i += 1;
+        }
+        if i < len && chars[i] == '"' {
+            i += 1;
+        }
+    } else {
+        while i < len && !chars[i].is_whitespace() {
+            delimiter.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    if delimiter.is_empty() {
+        return None;
+    }
+
+    // Skip to end of current line (heredoc body starts on next line)
+    while i < len && chars[i] != '\n' {
+        i += 1;
+    }
+    if i < len {
+        i += 1; // skip \n
+    }
+
+    // Scan lines for the closing delimiter
+    let delim_chars: Vec<char> = delimiter.chars().collect();
+    while i < len {
+        // Check if this line matches the delimiter exactly
+        let check = i;
+        let mut matches = check + delim_chars.len() <= len;
+        if matches {
+            for (j, dc) in delim_chars.iter().enumerate() {
+                if chars[check + j] != *dc {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+        if matches {
+            let after = check + delim_chars.len();
+            if after >= len || chars[after] == '\n' {
+                return Some((if after < len { after + 1 } else { after }, is_quoted));
+            }
+        }
+
+        // Skip to next line
+        while i < len && chars[i] != '\n' {
+            i += 1;
+        }
+        if i < len {
+            i += 1;
+        }
+    }
+
+    // Delimiter not found — treat rest as heredoc body
+    Some((len, is_quoted))
+}
+
 /// Split a command at shell operators (&&, ||, ;, |, |&),
 /// respecting single/double quotes and backslash escapes.
 ///
@@ -44,6 +158,17 @@ fn split_compound_command(command: &str) -> (Vec<String>, Vec<Operator>) {
         if sq || dq {
             buf.push(c);
             i += 1;
+            continue;
+        }
+
+        // Heredoc: skip body to avoid false operator splits inside it
+        if c == '<' && i + 1 < len && chars[i + 1] == '<'
+            && let Some((end_pos, _)) = skip_heredoc(&chars, i)
+        {
+            for ch in &chars[i..end_pos] {
+                buf.push(*ch);
+            }
+            i = end_pos;
             continue;
         }
 
@@ -150,6 +275,19 @@ fn extract_substitutions(command: &str) -> (String, Vec<String>) {
         if sq {
             outer.push(c);
             i += 1;
+            continue;
+        }
+
+        // Heredoc with quoted delimiter: skip body (no expansion)
+        // Unquoted heredocs fall through — their bodies DO expand substitutions.
+        if c == '<' && !dq && i + 1 < len && chars[i + 1] == '<'
+            && let Some((end_pos, is_quoted)) = skip_heredoc(&chars, i)
+            && is_quoted
+        {
+            for ch in &chars[i..end_pos] {
+                outer.push(*ch);
+            }
+            i = end_pos;
             continue;
         }
 
@@ -296,10 +434,49 @@ fn extract_substitutions(command: &str) -> (String, Vec<String>) {
     (outer, inners)
 }
 
+/// Skip past `>` or `>>` and any whitespace, then collect the unquoted target word.
+/// Returns the target path (e.g. "/dev/null", "file.txt") or empty string if nothing follows.
+fn extract_redir_target(chars: &[char], start: usize) -> String {
+    let len = chars.len();
+    let mut i = start;
+    // Skip past > or >>
+    if i < len && chars[i] == '>' {
+        i += 1;
+    }
+    if i < len && chars[i] == '>' {
+        i += 1; // >>
+    }
+    // Skip whitespace
+    while i < len && (chars[i] == ' ' || chars[i] == '\t') {
+        i += 1;
+    }
+    // Collect target word (unquoted for now — sufficient for /dev/null detection)
+    let mut target = String::new();
+    while i < len && !chars[i].is_whitespace() && chars[i] != ';' && chars[i] != '|' && chars[i] != '&' {
+        target.push(chars[i]);
+        i += 1;
+    }
+    target
+}
+
+/// Returns true if an fd number (0-9) refers to a standard stream (stdin/stdout/stderr).
+/// Custom fd numbers (3+) are NOT considered safe for duplication targets because they
+/// could have been redirected to files earlier in the same compound command
+/// (e.g. `exec 3>/tmp/evil && cmd >&3`).
+fn is_standard_fd(c: char) -> bool {
+    c == '0' || c == '1' || c == '2'
+}
+
 /// Detect output redirection (>, >>, &>, fd>) outside quotes.
 /// Does NOT flag:
 ///   - Input redirection (<) or here-docs (<<, <<<)
-///   - fd-to-fd duplication: >&N, N>&M, >&-, N>&- (e.g. 2>&1)
+///   - Redirection to /dev/null (discarding output is not mutating)
+///   - fd-to-fd duplication to standard streams: >&1, >&2, N>&1, N>&2
+///   - fd closing: >&-, N>&-
+///
+/// DOES flag (conservatively):
+///   - >&N where N >= 3 (custom fds could point to files)
+///   - N>&M where M >= 3 (same reason)
 pub fn has_output_redirection(command: &str) -> Option<Redirection> {
     let chars: Vec<char> = command.chars().collect();
     let len = chars.len();
@@ -334,8 +511,23 @@ pub fn has_output_redirection(command: &str) -> Option<Redirection> {
             continue;
         }
 
-        // &> or &>> (redirect both stdout+stderr to file — always mutation)
+        // Heredoc: skip body to avoid false redirection detection inside it
+        // (e.g. <noreply@anthropic.com> in a commit message heredoc)
+        if c == '<' && i + 1 < len && chars[i + 1] == '<'
+            && let Some((end_pos, _)) = skip_heredoc(&chars, i)
+        {
+            i = end_pos;
+            continue;
+        }
+
+        // &> or &>> (redirect both stdout+stderr to file)
         if c == '&' && i + 1 < len && chars[i + 1] == '>' {
+            let target = extract_redir_target(&chars, i + 1);
+            if target == "/dev/null" {
+                // Skip past &> /dev/null
+                i += 2;
+                continue;
+            }
             return Some(Redirection {
                 description: "output redirection (&>)".into(),
             });
@@ -343,13 +535,33 @@ pub fn has_output_redirection(command: &str) -> Option<Redirection> {
 
         // fd redirects: N>, N>>, N>&M, N>&-
         if c.is_ascii_digit() && i + 1 < len && chars[i + 1] == '>' {
-            // N>&M or N>&- is fd duplication/closing, not file output
+            // N>&- is fd closing — always safe
             if i + 2 < len
                 && chars[i + 2] == '&'
                 && i + 3 < len
-                && (chars[i + 3].is_ascii_digit() || chars[i + 3] == '-')
+                && chars[i + 3] == '-'
             {
                 i += 4;
+                continue;
+            }
+            // N>&M — safe only when M is a standard fd (0-2)
+            if i + 2 < len
+                && chars[i + 2] == '&'
+                && i + 3 < len
+                && chars[i + 3].is_ascii_digit()
+            {
+                if is_standard_fd(chars[i + 3]) {
+                    i += 4;
+                    continue;
+                }
+                return Some(Redirection {
+                    description: format!("output redirection ({c}>&{}, custom fd target)", chars[i + 3]),
+                });
+            }
+            // N> file or N>> file — check for /dev/null
+            let target = extract_redir_target(&chars, i + 1);
+            if target == "/dev/null" {
+                i += 2;
                 continue;
             }
             return Some(Redirection {
@@ -363,13 +575,33 @@ pub fn has_output_redirection(command: &str) -> Option<Redirection> {
                 i += 1;
                 continue;
             }
-            // >&N or >&- is fd duplication/closing
+            // >&- is fd closing — always safe
             if i + 1 < len
                 && chars[i + 1] == '&'
                 && i + 2 < len
-                && (chars[i + 2].is_ascii_digit() || chars[i + 2] == '-')
+                && chars[i + 2] == '-'
             {
                 i += 3;
+                continue;
+            }
+            // >&N — safe only when N is a standard fd (0-2)
+            if i + 1 < len
+                && chars[i + 1] == '&'
+                && i + 2 < len
+                && chars[i + 2].is_ascii_digit()
+            {
+                if is_standard_fd(chars[i + 2]) {
+                    i += 3;
+                    continue;
+                }
+                return Some(Redirection {
+                    description: format!("output redirection (>&{}, custom fd target)", chars[i + 2]),
+                });
+            }
+            // > file or >> file — check for /dev/null
+            let target = extract_redir_target(&chars, i);
+            if target == "/dev/null" {
+                i += 1;
                 continue;
             }
             return Some(Redirection {
@@ -546,8 +778,13 @@ mod tests {
     }
 
     #[test]
-    fn no_redir_fd_dup() {
+    fn no_redir_fd_dup_stderr_to_stdout() {
         assert!(has_output_redirection("cmd 2>&1").is_none());
+    }
+
+    #[test]
+    fn no_redir_fd_dup_stdout_to_stderr() {
+        assert!(has_output_redirection("cmd 1>&2").is_none());
     }
 
     #[test]
@@ -556,8 +793,13 @@ mod tests {
     }
 
     #[test]
-    fn no_redir_bare_dup() {
+    fn no_redir_bare_dup_to_stderr() {
         assert!(has_output_redirection("cmd >&2").is_none());
+    }
+
+    #[test]
+    fn no_redir_bare_close() {
+        assert!(has_output_redirection("cmd >&-").is_none());
     }
 
     #[test]
@@ -568,5 +810,161 @@ mod tests {
     #[test]
     fn no_redir_quoted() {
         assert!(has_output_redirection("echo 'hello > world'").is_none());
+    }
+
+    // ── /dev/null is non-mutating ──
+
+    #[test]
+    fn no_redir_devnull() {
+        assert!(has_output_redirection("cmd > /dev/null").is_none());
+    }
+
+    #[test]
+    fn no_redir_devnull_append() {
+        assert!(has_output_redirection("cmd >> /dev/null").is_none());
+    }
+
+    #[test]
+    fn no_redir_devnull_stderr() {
+        assert!(has_output_redirection("cmd 2> /dev/null").is_none());
+    }
+
+    #[test]
+    fn no_redir_devnull_ampersand() {
+        assert!(has_output_redirection("cmd &> /dev/null").is_none());
+    }
+
+    #[test]
+    fn redir_devnull_plus_file() {
+        // /dev/null for stderr is fine, but > file is still mutation
+        assert!(has_output_redirection("cmd > /tmp/out 2> /dev/null").is_some());
+    }
+
+    // ── Custom fd targets are suspicious ──
+
+    #[test]
+    fn redir_custom_fd_dup_target() {
+        // >&3 could be writing to a file if fd 3 was opened earlier
+        assert!(has_output_redirection("cmd >&3").is_some());
+    }
+
+    #[test]
+    fn redir_custom_fd_dup_numbered() {
+        // 2>&3 — fd 3 could be a file
+        assert!(has_output_redirection("cmd 2>&3").is_some());
+    }
+
+    #[test]
+    fn no_redir_standard_fd_dup() {
+        // >&1 is always safe (stdout to stdout)
+        assert!(has_output_redirection("cmd >&1").is_none());
+    }
+
+    // ── Heredoc parsing ──
+
+    #[test]
+    fn heredoc_skip_helper_basic() {
+        let input: Vec<char> = "<<'EOF'\nbody\nEOF\n".chars().collect();
+        let (end, quoted) = skip_heredoc(&input, 0).unwrap();
+        assert!(quoted);
+        assert_eq!(end, input.len());
+    }
+
+    #[test]
+    fn heredoc_skip_helper_unquoted() {
+        let input: Vec<char> = "<<EOF\nbody\nEOF\n".chars().collect();
+        let (end, quoted) = skip_heredoc(&input, 0).unwrap();
+        assert!(!quoted);
+        assert_eq!(end, input.len());
+    }
+
+    #[test]
+    fn heredoc_skip_helper_double_quoted() {
+        let input: Vec<char> = "<<\"EOF\"\nbody\nEOF\n".chars().collect();
+        let (end, quoted) = skip_heredoc(&input, 0).unwrap();
+        assert!(quoted);
+        assert_eq!(end, input.len());
+    }
+
+    #[test]
+    fn heredoc_skip_rejects_here_string() {
+        let input: Vec<char> = "<<<word".chars().collect();
+        assert!(skip_heredoc(&input, 0).is_none());
+    }
+
+    #[test]
+    fn heredoc_quoted_no_backtick_substitutions() {
+        // Backticks inside a quoted heredoc body should NOT be extracted
+        let cmd = "cat <<'EOF'\nline with `backticks` here\nEOF\n";
+        let (_, inners) = extract_substitutions(cmd);
+        assert!(inners.is_empty(), "quoted heredoc body should suppress backtick extraction");
+    }
+
+    #[test]
+    fn heredoc_quoted_no_dollar_substitutions() {
+        // $() inside a quoted heredoc body should NOT be extracted
+        let cmd = "cat <<'EOF'\nline with $(command) here\nEOF\n";
+        let (_, inners) = extract_substitutions(cmd);
+        assert!(inners.is_empty(), "quoted heredoc body should suppress $() extraction");
+    }
+
+    #[test]
+    fn heredoc_unquoted_extracts_substitutions() {
+        // Backticks inside an unquoted heredoc body ARE expanded
+        let cmd = "cat <<EOF\n`whoami`\nEOF\n";
+        let (_, inners) = extract_substitutions(cmd);
+        assert_eq!(inners, vec!["whoami"]);
+    }
+
+    #[test]
+    fn heredoc_no_false_compound_split() {
+        // Operators inside heredoc body should NOT split the command
+        let cmd = "cat <<'EOF'\nline && other ; stuff\nEOF\n";
+        let (parts, ops) = split_compound_command(cmd);
+        assert_eq!(parts.len(), 1, "heredoc body operators should not split: {parts:?}");
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn heredoc_markdown_backticks_not_substitutions() {
+        // The exact pattern that triggered the original bug:
+        // markdown inline code with backticks inside a quoted heredoc
+        let cmd = "cat <<'EOF'\n## Changes\n- **New:** `config.rs` — Config struct\n- **New:** `eval/mod.rs` — rewritten\nEOF\n";
+        let (_, inners) = extract_substitutions(cmd);
+        assert!(inners.is_empty(), "markdown backticks in heredoc should not be substitutions");
+    }
+
+    #[test]
+    fn heredoc_no_false_redirection() {
+        // > inside heredoc body should NOT be detected as output redirection
+        let cmd = "cat <<'EOF'\nCo-Authored-By: Name <noreply@anthropic.com>\nEOF\n";
+        assert!(has_output_redirection(cmd).is_none(), "heredoc body > should not trigger redirection");
+    }
+
+    #[test]
+    fn heredoc_unquoted_no_false_redirection() {
+        // Even unquoted heredocs: > in body is not output redirection
+        let cmd = "cat <<EOF\nsome text > with angle brackets\nEOF\n";
+        assert!(has_output_redirection(cmd).is_none(), "unquoted heredoc body > should not trigger redirection");
+    }
+
+    #[test]
+    fn heredoc_redir_before_heredoc_detected() {
+        // Actual redirection BEFORE the heredoc should still be caught
+        let cmd = "cat > /tmp/out <<'EOF'\nbody\nEOF\n";
+        assert!(has_output_redirection(cmd).is_some(), "redirection before heredoc should be detected");
+    }
+
+    #[test]
+    fn heredoc_in_dollar_subst() {
+        // Heredoc wrapped in $() — the common Claude Code pattern
+        let cmd = "gh pr create --body \"$(cat <<'EOF'\n## Summary\nCode with `backticks` and $(stuff)\nEOF\n)\"";
+        let (_, inners) = extract_substitutions(cmd);
+        // Only the outer $() should be extracted, containing the cat heredoc
+        assert_eq!(inners.len(), 1, "should extract one $() substitution");
+        assert!(inners[0].starts_with("cat <<'EOF'"));
+        // Now recursively parse the inner — should find NO further substitutions
+        let (_, inner_subs) = extract_substitutions(&inners[0]);
+        assert!(inner_subs.is_empty(), "heredoc body should not yield substitutions on recursive parse");
     }
 }

@@ -13,6 +13,24 @@ struct ToolInput {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let escalate_deny = args.iter().any(|a| a == "--escalate-deny");
+
+    // --dump-config [json]: print effective config and exit
+    if let Some(pos) = args.iter().position(|a| a == "--dump-config") {
+        let config = cc_toolgate::config::Config::load();
+        let format = args.get(pos + 1).map(|s| s.as_str());
+        match format {
+            Some("json") => {
+                println!("{}", serde_json::to_string_pretty(&config).unwrap());
+            }
+            _ => {
+                println!("{}", toml::to_string_pretty(&config).unwrap());
+            }
+        }
+        return;
+    }
+
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
         eprintln!("failed to read stdin");
@@ -43,7 +61,13 @@ fn main() {
     // Init logging (best-effort, no-op on failure)
     cc_toolgate::logging::init();
 
-    let result = cc_toolgate::evaluate(&command);
+    // Load config (user override or embedded defaults) and build registry
+    let config = cc_toolgate::config::Config::load();
+    let mut registry = cc_toolgate::eval::CommandRegistry::from_config(&config);
+    if escalate_deny {
+        registry.set_escalate_deny(true);
+    }
+    let result = registry.evaluate(&command);
 
     // Log decision to ~/.local/share/cc-toolgate/decisions.log
     cc_toolgate::logging::log_decision(&command, &result);
@@ -129,35 +153,33 @@ mod tests {
     }
 
     #[test]
-    fn allow_git_push_with_config() {
+    fn allow_git_status() {
+        assert_eq!(decision_for("git status"), Decision::Allow);
+    }
+
+    #[test]
+    fn ask_git_push() {
+        // Default config has no env-gated commands — push always asks
+        assert_eq!(decision_for("git push origin main"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_git_push_with_env() {
+        // Default config has empty config_env_var — env var doesn't help
         assert_eq!(
             decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push origin main"),
-            Decision::Allow
+            Decision::Ask
         );
     }
 
     #[test]
-    fn allow_git_pull_with_config() {
-        assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git pull origin main"),
-            Decision::Allow
-        );
+    fn ask_git_pull() {
+        assert_eq!(decision_for("git pull origin main"), Decision::Ask);
     }
 
     #[test]
-    fn allow_git_status_with_config() {
-        assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git status"),
-            Decision::Allow
-        );
-    }
-
-    #[test]
-    fn allow_git_add_with_config() {
-        assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git add ."),
-            Decision::Allow
-        );
+    fn ask_git_add() {
+        assert_eq!(decision_for("git add ."), Decision::Ask);
     }
 
     #[test]
@@ -451,19 +473,9 @@ mod tests {
     }
 
     #[test]
-    fn ask_git_push_no_config() {
-        assert_eq!(decision_for("git push origin main"), Decision::Ask);
-    }
-
-    #[test]
-    fn ask_git_pull_no_config() {
-        assert_eq!(decision_for("git pull origin main"), Decision::Ask);
-    }
-
-    #[test]
     fn ask_force_push() {
         assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push --force origin main"),
+            decision_for("git push --force origin main"),
             Decision::Ask
         );
     }
@@ -471,7 +483,7 @@ mod tests {
     #[test]
     fn ask_force_push_short_flag() {
         assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push -f origin main"),
+            decision_for("git push -f origin main"),
             Decision::Ask
         );
     }
@@ -479,19 +491,14 @@ mod tests {
     #[test]
     fn ask_force_push_with_lease() {
         assert_eq!(
-            decision_for(
-                "GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push --force-with-lease origin main"
-            ),
+            decision_for("git push --force-with-lease origin main"),
             Decision::Ask
         );
     }
 
     #[test]
     fn ask_git_commit() {
-        assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git commit -m 'test'"),
-            Decision::Ask
-        );
+        assert_eq!(decision_for("git commit -m 'test'"), Decision::Ask);
     }
 
     #[test]
@@ -559,10 +566,7 @@ mod tests {
 
     #[test]
     fn redir_git_status() {
-        assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git status > /tmp/s.txt"),
-            Decision::Ask
-        );
+        assert_eq!(decision_for("git status > /tmp/s.txt"), Decision::Ask);
     }
 
     #[test]
@@ -885,6 +889,32 @@ mod tests {
         assert_eq!(decision_for("git log > /tmp/log.txt"), Decision::Ask);
     }
 
+    // ── git -C (change directory) ──
+
+    #[test]
+    fn allow_git_c_status() {
+        assert_eq!(
+            decision_for("git -C /var/home/user/repo status"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn allow_git_c_log() {
+        assert_eq!(
+            decision_for("git -C ../other-repo log --oneline -5"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn ask_git_c_push() {
+        assert_eq!(
+            decision_for("git -C /some/repo push origin main"),
+            Decision::Ask
+        );
+    }
+
     // ── gh CLI read-only ──
 
     #[test]
@@ -1009,5 +1039,143 @@ mod tests {
     #[test]
     fn chain_cd_and_ls() {
         assert_eq!(decision_for("cd /tmp && ls -la"), Decision::Allow);
+    }
+
+    // ── escalate_deny ──
+
+    #[test]
+    fn escalate_deny_turns_deny_to_ask() {
+        let config = cc_toolgate::config::Config::default_config();
+        let mut registry = cc_toolgate::eval::CommandRegistry::from_config(&config);
+        registry.set_escalate_deny(true);
+        let result = registry.evaluate("shred /dev/sda");
+        assert_eq!(result.decision, Decision::Ask);
+        assert!(result.reason.contains("escalated from deny"));
+    }
+
+    #[test]
+    fn escalate_deny_does_not_affect_allow() {
+        let config = cc_toolgate::config::Config::default_config();
+        let mut registry = cc_toolgate::eval::CommandRegistry::from_config(&config);
+        registry.set_escalate_deny(true);
+        let result = registry.evaluate("ls -la");
+        assert_eq!(result.decision, Decision::Allow);
+    }
+
+    #[test]
+    fn escalate_deny_does_not_affect_ask() {
+        let config = cc_toolgate::config::Config::default_config();
+        let mut registry = cc_toolgate::eval::CommandRegistry::from_config(&config);
+        registry.set_escalate_deny(true);
+        let result = registry.evaluate("rm -rf /tmp");
+        assert_eq!(result.decision, Decision::Ask);
+    }
+
+    // ── heredoc ──
+
+    #[test]
+    fn heredoc_gh_pr_create_with_markdown() {
+        // Reproduces the original bug: markdown backticks in a heredoc
+        // body were extracted as command substitutions (21 of them!)
+        let cmd = "gh pr create --title \"Fix\" --body \"$(cat <<'EOF'\n## Summary\n- **New:** `config.rs`\n- **Changed:** `eval/mod.rs`\nEOF\n)\"";
+        assert_eq!(decision_for(cmd), Decision::Ask);
+        let r = reason_for(cmd);
+        // Should have exactly 1 substitution (the outer $(cat ...)), NOT 21
+        assert!(
+            r.contains("1 substitution(s)"),
+            "should have 1 substitution, not many: {r}"
+        );
+        // Should NOT contain "unrecognized command" from false backtick extraction
+        assert!(
+            !r.contains("unrecognized command"),
+            "heredoc body should not produce unrecognized commands: {r}"
+        );
+    }
+
+    #[test]
+    fn heredoc_git_commit_with_body() {
+        let cmd = "git commit -m \"$(cat <<'EOF'\nFix bug in `parse/shell.rs`\n\nCo-Authored-By: Claude\nEOF\n)\"";
+        assert_eq!(decision_for(cmd), Decision::Ask);
+        let r = reason_for(cmd);
+        assert!(
+            r.contains("1 substitution(s)"),
+            "should have 1 substitution, not many: {r}"
+        );
+        assert!(
+            !r.contains("unrecognized command"),
+            "heredoc body should not produce unrecognized commands: {r}"
+        );
+    }
+
+    // ── /dev/null redirection (non-mutating) ──
+
+    #[test]
+    fn allow_ls_devnull() {
+        assert_eq!(decision_for("ls -la > /dev/null"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_ls_devnull_stderr() {
+        assert_eq!(decision_for("ls -la 2> /dev/null"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_ls_devnull_combined() {
+        assert_eq!(decision_for("ls -la &> /dev/null"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_cargo_test_devnull() {
+        assert_eq!(
+            decision_for("cargo test 2> /dev/null"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn allow_git_status_devnull() {
+        assert_eq!(
+            decision_for("git status > /dev/null"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn ask_ls_devnull_plus_file() {
+        // stdout to file AND stderr to /dev/null — still mutating
+        assert_eq!(
+            decision_for("ls -la > /tmp/out 2> /dev/null"),
+            Decision::Ask
+        );
+    }
+
+    // ── Custom fd duplication safety ──
+
+    #[test]
+    fn fd_dup_to_custom_fd_asks() {
+        // >&3 could write to a file — not safe
+        assert_eq!(decision_for("ls -la >&3"), Decision::Ask);
+    }
+
+    #[test]
+    fn fd_dup_stderr_to_custom_fd_asks() {
+        // 2>&3 could write to a file
+        assert_eq!(decision_for("ls -la 2>&3"), Decision::Ask);
+    }
+
+    #[test]
+    fn fd_dup_to_standard_fd_allows() {
+        // >&2 is always safe
+        assert_eq!(decision_for("ls -la >&2"), Decision::Allow);
+    }
+
+    #[test]
+    fn escalate_deny_compound() {
+        let config = cc_toolgate::config::Config::default_config();
+        let mut registry = cc_toolgate::eval::CommandRegistry::from_config(&config);
+        registry.set_escalate_deny(true);
+        // With escalation, shred goes from Deny→Ask, so worst is Ask (not Deny)
+        let result = registry.evaluate("ls -la && shred foo");
+        assert_eq!(result.decision, Decision::Ask);
     }
 }
