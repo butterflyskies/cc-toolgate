@@ -1,30 +1,18 @@
 use crate::commands::CommandSpec;
+use crate::config::CargoConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
 
-/// Cargo subcommands that are safe (build / check / informational).
-const CARGO_SAFE: &[&str] = &[
-    "build",
-    "check",
-    "test",
-    "bench",
-    "run",
-    "clippy",
-    "fmt",
-    "doc",
-    "clean",
-    "update",
-    "fetch",
-    "tree",
-    "metadata",
-    "version",
-    "verify-project",
-    "search",
-    "generate-lockfile",
-];
-
-pub struct CargoSpec;
+pub struct CargoSpec {
+    safe_subcommands: Vec<String>,
+}
 
 impl CargoSpec {
+    pub fn from_config(config: &CargoConfig) -> Self {
+        Self {
+            safe_subcommands: config.safe_subcommands.clone(),
+        }
+    }
+
     /// Extract the cargo subcommand (first non-flag word after "cargo").
     fn subcommand<'a>(ctx: &'a CommandContext) -> Option<&'a str> {
         ctx.words
@@ -36,14 +24,10 @@ impl CargoSpec {
 }
 
 impl CommandSpec for CargoSpec {
-    fn names(&self) -> &[&str] {
-        &["cargo"]
-    }
-
     fn evaluate(&self, ctx: &CommandContext) -> RuleMatch {
         let sub_str = Self::subcommand(ctx).unwrap_or("?");
 
-        if CARGO_SAFE.contains(&sub_str) {
+        if self.safe_subcommands.iter().any(|s| s == sub_str) {
             if let Some(ref r) = ctx.redirection {
                 return RuleMatch {
                     decision: Decision::Ask,
@@ -71,15 +55,19 @@ impl CommandSpec for CargoSpec {
     }
 }
 
-pub static CARGO_SPEC: CargoSpec = CargoSpec;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+
+    fn spec() -> CargoSpec {
+        CargoSpec::from_config(&Config::default_config().cargo)
+    }
 
     fn eval(cmd: &str) -> Decision {
+        let s = spec();
         let ctx = CommandContext::from_command(cmd);
-        CARGO_SPEC.evaluate(&ctx).decision
+        s.evaluate(&ctx).decision
     }
 
     #[test]

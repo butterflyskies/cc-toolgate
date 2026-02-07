@@ -1,105 +1,20 @@
 use crate::commands::CommandSpec;
+use crate::config::GhConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
 
-/// gh CLI subcommands that are read-only.
-const GH_READ_ONLY: &[&str] = &[
-    "status",
-    // repo
-    "repo view",
-    "repo list",
-    "repo clone",
-    // pr
-    "pr list",
-    "pr view",
-    "pr diff",
-    "pr checks",
-    "pr status",
-    // issue
-    "issue list",
-    "issue view",
-    "issue status",
-    // run / workflow
-    "run list",
-    "run view",
-    "run watch",
-    "workflow list",
-    "workflow view",
-    // release
-    "release list",
-    "release view",
-    // misc read
-    "search",
-    "browse",
-    "api",
-    "auth status",
-    "auth token",
-    "extension list",
-    "label list",
-    "cache list",
-    "variable list",
-    "variable get",
-    "secret list",
-];
-
-/// gh CLI subcommands that mutate state (create, modify, delete).
-const GH_MUTATING: &[&str] = &[
-    // repo
-    "repo create",
-    "repo delete",
-    "repo edit",
-    "repo fork",
-    "repo rename",
-    "repo archive",
-    // pr
-    "pr create",
-    "pr merge",
-    "pr close",
-    "pr reopen",
-    "pr comment",
-    "pr review",
-    "pr edit",
-    // issue
-    "issue create",
-    "issue close",
-    "issue reopen",
-    "issue comment",
-    "issue edit",
-    "issue delete",
-    "issue transfer",
-    "issue pin",
-    "issue unpin",
-    // run / workflow
-    "run rerun",
-    "run cancel",
-    "run delete",
-    "workflow enable",
-    "workflow disable",
-    "workflow run",
-    // release
-    "release create",
-    "release delete",
-    "release edit",
-    // misc write
-    "auth login",
-    "auth logout",
-    "auth refresh",
-    "extension install",
-    "extension remove",
-    "extension upgrade",
-    "label create",
-    "label edit",
-    "label delete",
-    "cache delete",
-    "variable set",
-    "variable delete",
-    "secret set",
-    "secret delete",
-    "config set",
-];
-
-pub struct GhSpec;
+pub struct GhSpec {
+    read_only: Vec<String>,
+    mutating: Vec<String>,
+}
 
 impl GhSpec {
+    pub fn from_config(config: &GhConfig) -> Self {
+        Self {
+            read_only: config.read_only.clone(),
+            mutating: config.mutating.clone(),
+        }
+    }
+
     /// Get the two-word subcommand (e.g. "pr list") and one-word fallback.
     fn subcommands(ctx: &CommandContext) -> (String, String) {
         let sub_two = if ctx.words.len() >= 3 {
@@ -114,21 +29,15 @@ impl GhSpec {
             .unwrap_or_else(|| "?".to_string());
         (sub_two, sub_one)
     }
-
-    fn in_set(set: &[&str], val: &str) -> bool {
-        set.contains(&val)
-    }
 }
 
 impl CommandSpec for GhSpec {
-    fn names(&self) -> &[&str] {
-        &["gh"]
-    }
-
     fn evaluate(&self, ctx: &CommandContext) -> RuleMatch {
         let (sub_two, sub_one) = Self::subcommands(ctx);
 
-        if Self::in_set(GH_READ_ONLY, &sub_two) || Self::in_set(GH_READ_ONLY, &sub_one) {
+        let in_read_only = self.read_only.iter().any(|s| s == &sub_two)
+            || self.read_only.iter().any(|s| s == &sub_one);
+        if in_read_only {
             if let Some(ref r) = ctx.redirection {
                 return RuleMatch {
                     decision: Decision::Ask,
@@ -141,7 +50,9 @@ impl CommandSpec for GhSpec {
             };
         }
 
-        if Self::in_set(GH_MUTATING, &sub_two) || Self::in_set(GH_MUTATING, &sub_one) {
+        let in_mutating = self.mutating.iter().any(|s| s == &sub_two)
+            || self.mutating.iter().any(|s| s == &sub_one);
+        if in_mutating {
             return RuleMatch {
                 decision: Decision::Ask,
                 reason: format!("gh {sub_two} requires confirmation"),
@@ -155,15 +66,19 @@ impl CommandSpec for GhSpec {
     }
 }
 
-pub static GH_SPEC: GhSpec = GhSpec;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+
+    fn spec() -> GhSpec {
+        GhSpec::from_config(&Config::default_config().gh)
+    }
 
     fn eval(cmd: &str) -> Decision {
+        let s = spec();
         let ctx = CommandContext::from_command(cmd);
-        GH_SPEC.evaluate(&ctx).decision
+        s.evaluate(&ctx).decision
     }
 
     #[test]

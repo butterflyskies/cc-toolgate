@@ -1,29 +1,22 @@
 use crate::commands::CommandSpec;
+use crate::config::GitConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
 
-/// Git subcommands that are auto-allowed WITH AI gitconfig.
-const GIT_ALLOWED_WITH_CONFIG: &[&str] = &["push", "pull", "status", "add"];
-
-/// Git subcommands that are read-only and safe without AI gitconfig.
-const GIT_READ_ONLY: &[&str] = &[
-    "log",
-    "diff",
-    "show",
-    "branch",
-    "tag",
-    "remote",
-    "rev-parse",
-    "ls-files",
-    "ls-tree",
-    "shortlog",
-    "blame",
-    "describe",
-    "stash",
-];
-
-pub struct GitSpec;
+pub struct GitSpec {
+    read_only: Vec<String>,
+    allowed_with_config: Vec<String>,
+    force_push_flags: Vec<String>,
+}
 
 impl GitSpec {
+    pub fn from_config(config: &GitConfig) -> Self {
+        Self {
+            read_only: config.read_only.clone(),
+            allowed_with_config: config.allowed_with_config.clone(),
+            force_push_flags: config.force_push_flags.clone(),
+        }
+    }
+
     /// Extract the git subcommand word (e.g. "push" from "git push origin main").
     fn subcommand(ctx: &CommandContext) -> Option<String> {
         let mut iter = ctx.words.iter();
@@ -37,27 +30,24 @@ impl GitSpec {
 }
 
 impl CommandSpec for GitSpec {
-    fn names(&self) -> &[&str] {
-        &["git"]
-    }
-
     fn evaluate(&self, ctx: &CommandContext) -> RuleMatch {
         let sub = Self::subcommand(ctx);
         let sub_str = sub.as_deref().unwrap_or("?");
         let has_ai_config = ctx.has_env("GIT_CONFIG_GLOBAL");
 
         // Force-push → ask regardless of config
-        if sub_str == "push"
-            && ctx.has_any_flag(&["--force", "--force-with-lease", "-f"])
-        {
-            return RuleMatch {
-                decision: Decision::Ask,
-                reason: "git force-push requires confirmation".into(),
-            };
+        if sub_str == "push" {
+            let flag_strs: Vec<&str> = self.force_push_flags.iter().map(|s| s.as_str()).collect();
+            if ctx.has_any_flag(&flag_strs) {
+                return RuleMatch {
+                    decision: Decision::Ask,
+                    reason: "git force-push requires confirmation".into(),
+                };
+            }
         }
 
         // Read-only git subcommands — allowed without AI gitconfig
-        if GIT_READ_ONLY.contains(&sub_str) {
+        if self.read_only.iter().any(|s| s == sub_str) {
             if let Some(ref r) = ctx.redirection {
                 return RuleMatch {
                     decision: Decision::Ask,
@@ -71,7 +61,7 @@ impl CommandSpec for GitSpec {
         }
 
         // Write git subcommands require AI gitconfig
-        if GIT_ALLOWED_WITH_CONFIG.contains(&sub_str) {
+        if self.allowed_with_config.iter().any(|s| s == sub_str) {
             if has_ai_config {
                 if let Some(ref r) = ctx.redirection {
                     return RuleMatch {
@@ -105,15 +95,19 @@ impl CommandSpec for GitSpec {
     }
 }
 
-pub static GIT_SPEC: GitSpec = GitSpec;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+
+    fn spec() -> GitSpec {
+        GitSpec::from_config(&Config::default_config().git)
+    }
 
     fn eval(cmd: &str) -> Decision {
+        let s = spec();
         let ctx = CommandContext::from_command(cmd);
-        GIT_SPEC.evaluate(&ctx).decision
+        s.evaluate(&ctx).decision
     }
 
     #[test]

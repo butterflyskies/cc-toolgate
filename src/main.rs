@@ -13,6 +13,8 @@ struct ToolInput {
 }
 
 fn main() {
+    let escalate_deny = std::env::args().any(|a| a == "--escalate-deny");
+
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
         eprintln!("failed to read stdin");
@@ -43,7 +45,13 @@ fn main() {
     // Init logging (best-effort, no-op on failure)
     cc_toolgate::logging::init();
 
-    let result = cc_toolgate::evaluate(&command);
+    // Load config (user override or embedded defaults) and build registry
+    let config = cc_toolgate::config::Config::load();
+    let mut registry = cc_toolgate::eval::CommandRegistry::from_config(&config);
+    if escalate_deny {
+        registry.set_escalate_deny(true);
+    }
+    let result = registry.evaluate(&command);
 
     // Log decision to ~/.local/share/cc-toolgate/decisions.log
     cc_toolgate::logging::log_decision(&command, &result);
@@ -1009,5 +1017,45 @@ mod tests {
     #[test]
     fn chain_cd_and_ls() {
         assert_eq!(decision_for("cd /tmp && ls -la"), Decision::Allow);
+    }
+
+    // ── escalate_deny ──
+
+    #[test]
+    fn escalate_deny_turns_deny_to_ask() {
+        let config = cc_toolgate::config::Config::default_config();
+        let mut registry = cc_toolgate::eval::CommandRegistry::from_config(&config);
+        registry.set_escalate_deny(true);
+        let result = registry.evaluate("shred /dev/sda");
+        assert_eq!(result.decision, Decision::Ask);
+        assert!(result.reason.contains("escalated from deny"));
+    }
+
+    #[test]
+    fn escalate_deny_does_not_affect_allow() {
+        let config = cc_toolgate::config::Config::default_config();
+        let mut registry = cc_toolgate::eval::CommandRegistry::from_config(&config);
+        registry.set_escalate_deny(true);
+        let result = registry.evaluate("ls -la");
+        assert_eq!(result.decision, Decision::Allow);
+    }
+
+    #[test]
+    fn escalate_deny_does_not_affect_ask() {
+        let config = cc_toolgate::config::Config::default_config();
+        let mut registry = cc_toolgate::eval::CommandRegistry::from_config(&config);
+        registry.set_escalate_deny(true);
+        let result = registry.evaluate("rm -rf /tmp");
+        assert_eq!(result.decision, Decision::Ask);
+    }
+
+    #[test]
+    fn escalate_deny_compound() {
+        let config = cc_toolgate::config::Config::default_config();
+        let mut registry = cc_toolgate::eval::CommandRegistry::from_config(&config);
+        registry.set_escalate_deny(true);
+        // With escalation, shred goes from Deny→Ask, so worst is Ask (not Deny)
+        let result = registry.evaluate("ls -la && shred foo");
+        assert_eq!(result.decision, Decision::Ask);
     }
 }

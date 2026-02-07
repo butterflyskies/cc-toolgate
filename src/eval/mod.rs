@@ -7,35 +7,73 @@ pub use decision::{BaseDisposition, Decision, FlagDisposition, RuleMatch};
 use std::collections::HashMap;
 
 use crate::commands::CommandSpec;
+use crate::config::Config;
 use crate::parse;
 
 /// Registry of all command specs, keyed by command name.
 pub struct CommandRegistry {
-    specs: HashMap<&'static str, &'static dyn CommandSpec>,
-}
-
-impl Default for CommandRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
+    specs: HashMap<String, Box<dyn CommandSpec>>,
+    escalate_deny: bool,
 }
 
 impl CommandRegistry {
-    pub fn new() -> Self {
+    /// Build the registry from configuration.
+    pub fn from_config(config: &Config) -> Self {
+        use crate::commands::{
+            cargo::CargoSpec,
+            deny::DenyCommandSpec,
+            gh::GhSpec,
+            git::GitSpec,
+            kubectl::KubectlSpec,
+            simple::SimpleCommandSpec,
+        };
+
+        let mut specs: HashMap<String, Box<dyn CommandSpec>> = HashMap::new();
+
+        // Deny commands (registered first, complex specs override if needed)
+        for name in &config.commands.deny {
+            specs.insert(name.clone(), Box::new(DenyCommandSpec));
+        }
+
+        // Allow commands
+        for name in &config.commands.allow {
+            specs.insert(name.clone(), Box::new(SimpleCommandSpec::new(Decision::Allow)));
+        }
+
+        // Ask commands
+        for name in &config.commands.ask {
+            specs.insert(name.clone(), Box::new(SimpleCommandSpec::new(Decision::Ask)));
+        }
+
+        // Complex command specs (override any simple entry for the same name)
+        specs.insert("git".into(), Box::new(GitSpec::from_config(&config.git)));
+        specs.insert("cargo".into(), Box::new(CargoSpec::from_config(&config.cargo)));
+        specs.insert("kubectl".into(), Box::new(KubectlSpec::from_config(&config.kubectl)));
+        specs.insert("gh".into(), Box::new(GhSpec::from_config(&config.gh)));
+
         Self {
-            specs: HashMap::new(),
+            specs,
+            escalate_deny: config.settings.escalate_deny,
         }
     }
 
-    pub fn register(&mut self, spec: &'static dyn CommandSpec) {
-        for name in spec.names() {
-            self.specs.insert(name, spec);
-        }
+    /// Override the escalate_deny setting (e.g. from --escalate-deny CLI flag).
+    pub fn set_escalate_deny(&mut self, escalate: bool) {
+        self.escalate_deny = escalate;
     }
 
     /// Look up a spec by exact command name.
-    pub fn get(&self, name: &str) -> Option<&&'static dyn CommandSpec> {
-        self.specs.get(name)
+    fn get(&self, name: &str) -> Option<&dyn CommandSpec> {
+        self.specs.get(name).map(|b| b.as_ref())
+    }
+
+    /// Apply escalate_deny: DENY → ASK with annotation.
+    fn maybe_escalate(&self, mut result: RuleMatch) -> RuleMatch {
+        if self.escalate_deny && result.decision == Decision::Deny {
+            result.decision = Decision::Ask;
+            result.reason = format!("{} (escalated from deny)", result.reason);
+        }
+        result
     }
 
     /// Evaluate a single (non-compound) command against the registry.
@@ -52,7 +90,7 @@ impl CommandRegistry {
 
         // Look up by exact base command name
         if let Some(spec) = self.get(&ctx.base_command) {
-            return spec.evaluate(&ctx);
+            return self.maybe_escalate(spec.evaluate(&ctx));
         }
 
         // Dotted command fallback for deny list (e.g. mkfs.ext4 → mkfs)
@@ -60,7 +98,7 @@ impl CommandRegistry {
             && prefix != ctx.base_command
             && let Some(spec) = self.get(prefix)
         {
-            return spec.evaluate(&ctx);
+            return self.maybe_escalate(spec.evaluate(&ctx));
         }
 
         // Fallthrough → ask
@@ -136,26 +174,4 @@ impl CommandRegistry {
             reason: format!("{}:\n{}", header, reasons.join("\n")),
         }
     }
-}
-
-/// Build the default registry with all command specs.
-pub fn default_registry() -> CommandRegistry {
-    let mut registry = CommandRegistry::new();
-
-    // Register all command specs
-    for spec in crate::commands::deny::DENY_SPECS.iter() {
-        registry.register(*spec);
-    }
-    registry.register(&crate::commands::git::GIT_SPEC);
-    registry.register(&crate::commands::cargo::CARGO_SPEC);
-    registry.register(&crate::commands::kubectl::KUBECTL_SPEC);
-    registry.register(&crate::commands::gh::GH_SPEC);
-    for spec in crate::commands::simple::ALLOW_SPECS.iter() {
-        registry.register(*spec);
-    }
-    for spec in crate::commands::simple::ASK_SPECS.iter() {
-        registry.register(*spec);
-    }
-
-    registry
 }
