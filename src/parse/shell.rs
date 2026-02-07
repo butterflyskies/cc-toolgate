@@ -511,6 +511,15 @@ pub fn has_output_redirection(command: &str) -> Option<Redirection> {
             continue;
         }
 
+        // Heredoc: skip body to avoid false redirection detection inside it
+        // (e.g. <noreply@anthropic.com> in a commit message heredoc)
+        if c == '<' && i + 1 < len && chars[i + 1] == '<'
+            && let Some((end_pos, _)) = skip_heredoc(&chars, i)
+        {
+            i = end_pos;
+            continue;
+        }
+
         // &> or &>> (redirect both stdout+stderr to file)
         if c == '&' && i + 1 < len && chars[i + 1] == '>' {
             let target = extract_redir_target(&chars, i + 1);
@@ -923,6 +932,27 @@ mod tests {
         let cmd = "cat <<'EOF'\n## Changes\n- **New:** `config.rs` — Config struct\n- **New:** `eval/mod.rs` — rewritten\nEOF\n";
         let (_, inners) = extract_substitutions(cmd);
         assert!(inners.is_empty(), "markdown backticks in heredoc should not be substitutions");
+    }
+
+    #[test]
+    fn heredoc_no_false_redirection() {
+        // > inside heredoc body should NOT be detected as output redirection
+        let cmd = "cat <<'EOF'\nCo-Authored-By: Name <noreply@anthropic.com>\nEOF\n";
+        assert!(has_output_redirection(cmd).is_none(), "heredoc body > should not trigger redirection");
+    }
+
+    #[test]
+    fn heredoc_unquoted_no_false_redirection() {
+        // Even unquoted heredocs: > in body is not output redirection
+        let cmd = "cat <<EOF\nsome text > with angle brackets\nEOF\n";
+        assert!(has_output_redirection(cmd).is_none(), "unquoted heredoc body > should not trigger redirection");
+    }
+
+    #[test]
+    fn heredoc_redir_before_heredoc_detected() {
+        // Actual redirection BEFORE the heredoc should still be caught
+        let cmd = "cat > /tmp/out <<'EOF'\nbody\nEOF\n";
+        assert!(has_output_redirection(cmd).is_some(), "redirection before heredoc should be detected");
     }
 
     #[test]
