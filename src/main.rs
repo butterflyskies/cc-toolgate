@@ -153,6 +153,11 @@ mod tests {
     }
 
     #[test]
+    fn allow_git_status() {
+        assert_eq!(decision_for("git status"), Decision::Allow);
+    }
+
+    #[test]
     fn allow_git_status_with_config() {
         assert_eq!(
             decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git status"),
@@ -1047,6 +1052,42 @@ mod tests {
         registry.set_escalate_deny(true);
         let result = registry.evaluate("rm -rf /tmp");
         assert_eq!(result.decision, Decision::Ask);
+    }
+
+    // ── heredoc ──
+
+    #[test]
+    fn heredoc_gh_pr_create_with_markdown() {
+        // Reproduces the original bug: markdown backticks in a heredoc
+        // body were extracted as command substitutions (21 of them!)
+        let cmd = "gh pr create --title \"Fix\" --body \"$(cat <<'EOF'\n## Summary\n- **New:** `config.rs`\n- **Changed:** `eval/mod.rs`\nEOF\n)\"";
+        assert_eq!(decision_for(cmd), Decision::Ask);
+        let r = reason_for(cmd);
+        // Should have exactly 1 substitution (the outer $(cat ...)), NOT 21
+        assert!(
+            r.contains("1 substitution(s)"),
+            "should have 1 substitution, not many: {r}"
+        );
+        // Should NOT contain "unrecognized command" from false backtick extraction
+        assert!(
+            !r.contains("unrecognized command"),
+            "heredoc body should not produce unrecognized commands: {r}"
+        );
+    }
+
+    #[test]
+    fn heredoc_git_commit_with_body() {
+        let cmd = "GIT_CONFIG_GLOBAL=~/.gitconfig.ai git commit -m \"$(cat <<'EOF'\nFix bug in `parse/shell.rs`\n\nCo-Authored-By: Claude\nEOF\n)\"";
+        assert_eq!(decision_for(cmd), Decision::Ask);
+        let r = reason_for(cmd);
+        assert!(
+            r.contains("1 substitution(s)"),
+            "should have 1 substitution, not many: {r}"
+        );
+        assert!(
+            !r.contains("unrecognized command"),
+            "heredoc body should not produce unrecognized commands: {r}"
+        );
     }
 
     #[test]

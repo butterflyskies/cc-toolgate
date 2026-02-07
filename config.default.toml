@@ -71,13 +71,13 @@ deny = [
 [git]
 # Subcommands allowed without AI gitconfig (read-only, safe).
 read_only = [
-    "log", "diff", "show", "branch", "tag", "remote",
+    "status", "log", "diff", "show", "branch", "tag", "remote",
     "rev-parse", "ls-files", "ls-tree", "shortlog",
     "blame", "describe", "stash",
 ]
 
 # Subcommands auto-allowed only with GIT_CONFIG_GLOBAL set.
-allowed_with_config = ["push", "pull", "status", "add"]
+allowed_with_config = ["push", "pull", "add"]
 
 # Flags that escalate push to ASK regardless of config.
 force_push_flags = ["--force", "--force-with-lease", "-f"]

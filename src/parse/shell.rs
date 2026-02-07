@@ -1,5 +1,119 @@
 use super::types::{Operator, ParsedPipeline, Redirection, ShellSegment};
 
+/// When `<<` is encountered at `chars[start]`, parse the heredoc delimiter
+/// and find where the body ends.
+///
+/// Returns `Some((end_pos, is_quoted))`:
+/// - `end_pos`: position after the closing delimiter line
+/// - `is_quoted`: true if delimiter was quoted (`<<'EOF'` or `<<"EOF"`), suppressing expansion
+///
+/// Returns `None` if not a valid heredoc (e.g., `<<<` here-string, missing delimiter).
+fn skip_heredoc(chars: &[char], start: usize) -> Option<(usize, bool)> {
+    let len = chars.len();
+    let mut i = start;
+
+    // Verify <<
+    if i + 1 >= len || chars[i] != '<' || chars[i + 1] != '<' {
+        return None;
+    }
+    i += 2;
+
+    // Reject <<< (here-string)
+    if i < len && chars[i] == '<' {
+        return None;
+    }
+
+    // Optional - for <<-
+    if i < len && chars[i] == '-' {
+        i += 1;
+    }
+
+    // Skip spaces/tabs before delimiter (not newlines)
+    while i < len && (chars[i] == ' ' || chars[i] == '\t') {
+        i += 1;
+    }
+
+    if i >= len || chars[i] == '\n' {
+        return None;
+    }
+
+    // Read delimiter word (possibly quoted)
+    let mut delimiter = String::new();
+    let mut is_quoted = false;
+
+    if chars[i] == '\'' {
+        is_quoted = true;
+        i += 1;
+        while i < len && chars[i] != '\'' && chars[i] != '\n' {
+            delimiter.push(chars[i]);
+            i += 1;
+        }
+        if i < len && chars[i] == '\'' {
+            i += 1;
+        }
+    } else if chars[i] == '"' {
+        is_quoted = true;
+        i += 1;
+        while i < len && chars[i] != '"' && chars[i] != '\n' {
+            delimiter.push(chars[i]);
+            i += 1;
+        }
+        if i < len && chars[i] == '"' {
+            i += 1;
+        }
+    } else {
+        while i < len && !chars[i].is_whitespace() {
+            delimiter.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    if delimiter.is_empty() {
+        return None;
+    }
+
+    // Skip to end of current line (heredoc body starts on next line)
+    while i < len && chars[i] != '\n' {
+        i += 1;
+    }
+    if i < len {
+        i += 1; // skip \n
+    }
+
+    // Scan lines for the closing delimiter
+    let delim_chars: Vec<char> = delimiter.chars().collect();
+    while i < len {
+        // Check if this line matches the delimiter exactly
+        let check = i;
+        let mut matches = check + delim_chars.len() <= len;
+        if matches {
+            for (j, dc) in delim_chars.iter().enumerate() {
+                if chars[check + j] != *dc {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+        if matches {
+            let after = check + delim_chars.len();
+            if after >= len || chars[after] == '\n' {
+                return Some((if after < len { after + 1 } else { after }, is_quoted));
+            }
+        }
+
+        // Skip to next line
+        while i < len && chars[i] != '\n' {
+            i += 1;
+        }
+        if i < len {
+            i += 1;
+        }
+    }
+
+    // Delimiter not found — treat rest as heredoc body
+    Some((len, is_quoted))
+}
+
 /// Split a command at shell operators (&&, ||, ;, |, |&),
 /// respecting single/double quotes and backslash escapes.
 ///
@@ -44,6 +158,17 @@ fn split_compound_command(command: &str) -> (Vec<String>, Vec<Operator>) {
         if sq || dq {
             buf.push(c);
             i += 1;
+            continue;
+        }
+
+        // Heredoc: skip body to avoid false operator splits inside it
+        if c == '<' && i + 1 < len && chars[i + 1] == '<'
+            && let Some((end_pos, _)) = skip_heredoc(&chars, i)
+        {
+            for ch in &chars[i..end_pos] {
+                buf.push(*ch);
+            }
+            i = end_pos;
             continue;
         }
 
@@ -150,6 +275,19 @@ fn extract_substitutions(command: &str) -> (String, Vec<String>) {
         if sq {
             outer.push(c);
             i += 1;
+            continue;
+        }
+
+        // Heredoc with quoted delimiter: skip body (no expansion)
+        // Unquoted heredocs fall through — their bodies DO expand substitutions.
+        if c == '<' && !dq && i + 1 < len && chars[i + 1] == '<'
+            && let Some((end_pos, is_quoted)) = skip_heredoc(&chars, i)
+            && is_quoted
+        {
+            for ch in &chars[i..end_pos] {
+                outer.push(*ch);
+            }
+            i = end_pos;
             continue;
         }
 
@@ -568,5 +706,92 @@ mod tests {
     #[test]
     fn no_redir_quoted() {
         assert!(has_output_redirection("echo 'hello > world'").is_none());
+    }
+
+    // ── Heredoc parsing ──
+
+    #[test]
+    fn heredoc_skip_helper_basic() {
+        let input: Vec<char> = "<<'EOF'\nbody\nEOF\n".chars().collect();
+        let (end, quoted) = skip_heredoc(&input, 0).unwrap();
+        assert!(quoted);
+        assert_eq!(end, input.len());
+    }
+
+    #[test]
+    fn heredoc_skip_helper_unquoted() {
+        let input: Vec<char> = "<<EOF\nbody\nEOF\n".chars().collect();
+        let (end, quoted) = skip_heredoc(&input, 0).unwrap();
+        assert!(!quoted);
+        assert_eq!(end, input.len());
+    }
+
+    #[test]
+    fn heredoc_skip_helper_double_quoted() {
+        let input: Vec<char> = "<<\"EOF\"\nbody\nEOF\n".chars().collect();
+        let (end, quoted) = skip_heredoc(&input, 0).unwrap();
+        assert!(quoted);
+        assert_eq!(end, input.len());
+    }
+
+    #[test]
+    fn heredoc_skip_rejects_here_string() {
+        let input: Vec<char> = "<<<word".chars().collect();
+        assert!(skip_heredoc(&input, 0).is_none());
+    }
+
+    #[test]
+    fn heredoc_quoted_no_backtick_substitutions() {
+        // Backticks inside a quoted heredoc body should NOT be extracted
+        let cmd = "cat <<'EOF'\nline with `backticks` here\nEOF\n";
+        let (_, inners) = extract_substitutions(cmd);
+        assert!(inners.is_empty(), "quoted heredoc body should suppress backtick extraction");
+    }
+
+    #[test]
+    fn heredoc_quoted_no_dollar_substitutions() {
+        // $() inside a quoted heredoc body should NOT be extracted
+        let cmd = "cat <<'EOF'\nline with $(command) here\nEOF\n";
+        let (_, inners) = extract_substitutions(cmd);
+        assert!(inners.is_empty(), "quoted heredoc body should suppress $() extraction");
+    }
+
+    #[test]
+    fn heredoc_unquoted_extracts_substitutions() {
+        // Backticks inside an unquoted heredoc body ARE expanded
+        let cmd = "cat <<EOF\n`whoami`\nEOF\n";
+        let (_, inners) = extract_substitutions(cmd);
+        assert_eq!(inners, vec!["whoami"]);
+    }
+
+    #[test]
+    fn heredoc_no_false_compound_split() {
+        // Operators inside heredoc body should NOT split the command
+        let cmd = "cat <<'EOF'\nline && other ; stuff\nEOF\n";
+        let (parts, ops) = split_compound_command(cmd);
+        assert_eq!(parts.len(), 1, "heredoc body operators should not split: {parts:?}");
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn heredoc_markdown_backticks_not_substitutions() {
+        // The exact pattern that triggered the original bug:
+        // markdown inline code with backticks inside a quoted heredoc
+        let cmd = "cat <<'EOF'\n## Changes\n- **New:** `config.rs` — Config struct\n- **New:** `eval/mod.rs` — rewritten\nEOF\n";
+        let (_, inners) = extract_substitutions(cmd);
+        assert!(inners.is_empty(), "markdown backticks in heredoc should not be substitutions");
+    }
+
+    #[test]
+    fn heredoc_in_dollar_subst() {
+        // Heredoc wrapped in $() — the common Claude Code pattern
+        let cmd = "gh pr create --body \"$(cat <<'EOF'\n## Summary\nCode with `backticks` and $(stuff)\nEOF\n)\"";
+        let (_, inners) = extract_substitutions(cmd);
+        // Only the outer $() should be extracted, containing the cat heredoc
+        assert_eq!(inners.len(), 1, "should extract one $() substitution");
+        assert!(inners[0].starts_with("cat <<'EOF'"));
+        // Now recursively parse the inner — should find NO further substitutions
+        let (_, inner_subs) = extract_substitutions(&inners[0]);
+        assert!(inner_subs.is_empty(), "heredoc body should not yield substitutions on recursive parse");
     }
 }
