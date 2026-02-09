@@ -45,7 +45,7 @@ allow = [
     "uname", "hostname", "id", "whoami", "groups", "nproc",
     "uptime", "arch", "date", "free", "df", "du", "lsblk",
     # Environment
-    "env", "printenv", "locale",
+    "printenv", "locale",
     # Shell builtins / control
     "test", "[", "true", "false", "type", "command", "hash",
     "export", "unset", "set", "source", ".",
@@ -55,7 +55,7 @@ allow = [
     # Directory listing
     "find",
     # Misc safe
-    "xargs", "clear", "tput", "reset",
+    "clear", "tput", "reset",
     # Rust CLI tools
     "eza", "bat", "fd", "rg", "sd", "dust", "procs",
     "tokei", "delta", "zoxide", "hyperfine", "just",
@@ -63,7 +63,6 @@ allow = [
 
 ask = [
     "rm", "rmdir",
-    "sudo", "su", "doas", "pkexec",
     "mkdir", "touch",
     "mv", "cp", "ln",
     "chmod", "chown", "chgrp",
@@ -80,6 +79,24 @@ deny = [
     "mkfs", "fdisk", "parted",
     "shutdown", "reboot", "halt", "poweroff",
     "eval",
+]
+
+[wrappers]
+# Commands that execute their arguments as subcommands.
+# The wrapped command is extracted (skipping wrapper flags) and evaluated.
+# Final decision = max(floor, wrapped_command_decision).
+#
+# allow_floor: wrapper itself is safe; the wrapped command determines disposition.
+# ask_floor: wrapper always requires at least confirmation; wrapped command can escalate.
+allow_floor = [
+    "xargs", "parallel",
+    "env",
+    "nohup", "nice", "timeout", "time", "watch",
+    "strace", "ltrace",
+]
+
+ask_floor = [
+    "sudo", "su", "doas", "pkexec",
 ]
 
 [git]

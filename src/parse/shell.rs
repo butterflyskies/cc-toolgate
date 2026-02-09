@@ -1,14 +1,24 @@
 use super::types::{Operator, ParsedPipeline, Redirection, ShellSegment};
 
+/// Result of parsing a heredoc at `<<DELIM`.
+///
+/// In shell, the text after the delimiter word on the same line is NOT part of
+/// the heredoc body — it's still live shell syntax (pipes, redirections, etc.).
+/// For example: `cat <<'EOF' | kubectl apply -f -`
+///   - `after_delim`: position right after the delimiter word (before ` | kubectl...`)
+///   - `body_end`: position after the closing delimiter line
+///   - `is_quoted`: whether the delimiter was quoted, suppressing expansion
+struct HeredocSpan {
+    after_delim: usize,
+    body_end: usize,
+    is_quoted: bool,
+}
+
 /// When `<<` is encountered at `chars[start]`, parse the heredoc delimiter
 /// and find where the body ends.
 ///
-/// Returns `Some((end_pos, is_quoted))`:
-/// - `end_pos`: position after the closing delimiter line
-/// - `is_quoted`: true if delimiter was quoted (`<<'EOF'` or `<<"EOF"`), suppressing expansion
-///
 /// Returns `None` if not a valid heredoc (e.g., `<<<` here-string, missing delimiter).
-fn skip_heredoc(chars: &[char], start: usize) -> Option<(usize, bool)> {
+fn skip_heredoc(chars: &[char], start: usize) -> Option<HeredocSpan> {
     let len = chars.len();
     let mut i = start;
 
@@ -72,6 +82,10 @@ fn skip_heredoc(chars: &[char], start: usize) -> Option<(usize, bool)> {
         return None;
     }
 
+    // Mark position right after delimiter word — the rest of this line
+    // is still live shell syntax (pipes, redirections, etc.)
+    let after_delim = i;
+
     // Skip to end of current line (heredoc body starts on next line)
     while i < len && chars[i] != '\n' {
         i += 1;
@@ -97,7 +111,8 @@ fn skip_heredoc(chars: &[char], start: usize) -> Option<(usize, bool)> {
         if matches {
             let after = check + delim_chars.len();
             if after >= len || chars[after] == '\n' {
-                return Some((if after < len { after + 1 } else { after }, is_quoted));
+                let body_end = if after < len { after + 1 } else { after };
+                return Some(HeredocSpan { after_delim, body_end, is_quoted });
             }
         }
 
@@ -111,7 +126,7 @@ fn skip_heredoc(chars: &[char], start: usize) -> Option<(usize, bool)> {
     }
 
     // Delimiter not found — treat rest as heredoc body
-    Some((len, is_quoted))
+    Some(HeredocSpan { after_delim, body_end: len, is_quoted })
 }
 
 /// Split a command at shell operators (&&, ||, ;, |, |&),
@@ -161,14 +176,76 @@ fn split_compound_command(command: &str) -> (Vec<String>, Vec<Operator>) {
             continue;
         }
 
-        // Heredoc: skip body to avoid false operator splits inside it
+        // Heredoc: include <<DELIM token, let rest of line be processed
+        // normally for operators, then skip the body entirely.
         if c == '<' && i + 1 < len && chars[i + 1] == '<'
-            && let Some((end_pos, _)) = skip_heredoc(&chars, i)
+            && let Some(span) = skip_heredoc(&chars, i)
         {
-            for ch in &chars[i..end_pos] {
+            // Push the <<DELIM token (up to after_delim)
+            for ch in &chars[i..span.after_delim] {
                 buf.push(*ch);
             }
-            i = end_pos;
+            // Record that we need to skip the heredoc body later
+            // For now, continue processing the rest of the <<DELIM line
+            // for operators. We'll find the \n and then jump to body_end.
+            //
+            // Strategy: replace heredoc body (from the \n after the DELIM
+            // line through body_end) with nothing — just advance past it.
+            // But we need to let the rest of this line be processed first.
+            // So we stash the body_end and jump there when we hit \n.
+            //
+            // Simplest approach: scan rest of line normally for operators,
+            // then when we find \n, jump to body_end instead of i+1.
+            i = span.after_delim;
+            // Find end of current line, processing operators along the way
+            while i < len && chars[i] != '\n' {
+                let c2 = chars[i];
+
+                // Two-char operators on same line as heredoc
+                if i + 1 < len {
+                    let next2 = chars[i + 1];
+                    let op = match (c2, next2) {
+                        ('&', '&') => Some(Operator::And),
+                        ('|', '|') => Some(Operator::Or),
+                        ('|', '&') => Some(Operator::PipeErr),
+                        _ => None,
+                    };
+                    if let Some(op) = op {
+                        let trimmed = buf.trim().to_string();
+                        parts.push(trimmed);
+                        operators.push(op);
+                        buf.clear();
+                        i += 2;
+                        continue;
+                    }
+                }
+
+                // Single-char operators on same line as heredoc
+                match c2 {
+                    '|' => {
+                        let trimmed = buf.trim().to_string();
+                        parts.push(trimmed);
+                        operators.push(Operator::Pipe);
+                        buf.clear();
+                        i += 1;
+                        continue;
+                    }
+                    ';' => {
+                        let trimmed = buf.trim().to_string();
+                        parts.push(trimmed);
+                        operators.push(Operator::Semi);
+                        buf.clear();
+                        i += 1;
+                        continue;
+                    }
+                    _ => {
+                        buf.push(c2);
+                        i += 1;
+                    }
+                }
+            }
+            // Skip heredoc body: jump from end-of-line to body_end
+            i = span.body_end;
             continue;
         }
 
@@ -243,6 +320,7 @@ fn extract_substitutions(command: &str) -> (String, Vec<String>) {
     let mut inners = Vec::new();
     let mut i = 0;
     let (mut sq, mut dq, mut esc) = (false, false, false);
+    let mut heredoc_body_end: Option<usize> = None;
 
     while i < len {
         let c = chars[i];
@@ -278,16 +356,29 @@ fn extract_substitutions(command: &str) -> (String, Vec<String>) {
             continue;
         }
 
-        // Heredoc with quoted delimiter: skip body (no expansion)
+        // Heredoc with quoted delimiter: skip body (no expansion).
         // Unquoted heredocs fall through — their bodies DO expand substitutions.
+        // In both cases, the rest of the <<DELIM line is still live syntax.
         if c == '<' && !dq && i + 1 < len && chars[i + 1] == '<'
-            && let Some((end_pos, is_quoted)) = skip_heredoc(&chars, i)
-            && is_quoted
+            && let Some(span) = skip_heredoc(&chars, i)
+            && span.is_quoted
         {
-            for ch in &chars[i..end_pos] {
+            // Push <<DELIM token
+            for ch in &chars[i..span.after_delim] {
                 outer.push(*ch);
             }
-            i = end_pos;
+            // Skip past the <<DELIM token; the outer loop will process the
+            // rest of the line normally (handling $(), backticks, etc.).
+            // When we hit \n, we jump over the heredoc body.
+            i = span.after_delim;
+            heredoc_body_end = Some(span.body_end);
+            continue;
+        }
+
+        // If we're on a heredoc-bearing line and hit \n, skip the body.
+        if c == '\n' && let Some(body_end) = heredoc_body_end.take() {
+            outer.push('\n');
+            i = body_end;
             continue;
         }
 
@@ -482,6 +573,7 @@ pub fn has_output_redirection(command: &str) -> Option<Redirection> {
     let len = chars.len();
     let mut i = 0;
     let (mut sq, mut dq, mut esc) = (false, false, false);
+    let mut heredoc_body_end: Option<usize> = None;
 
     while i < len {
         let c = chars[i];
@@ -511,12 +603,25 @@ pub fn has_output_redirection(command: &str) -> Option<Redirection> {
             continue;
         }
 
-        // Heredoc: skip body to avoid false redirection detection inside it
-        // (e.g. <noreply@anthropic.com> in a commit message heredoc)
+        // Heredoc: skip only the body to avoid false redirection detection
+        // inside it (e.g. <noreply@anthropic.com> in a commit message).
+        // The rest of the <<DELIM line is still live syntax and must be scanned
+        // for actual redirections (e.g. `cat <<EOF > file`).
         if c == '<' && i + 1 < len && chars[i + 1] == '<'
-            && let Some((end_pos, _)) = skip_heredoc(&chars, i)
+            && let Some(span) = skip_heredoc(&chars, i)
         {
-            i = end_pos;
+            // Skip past <<DELIM token only
+            i = span.after_delim;
+            // Scan rest of line normally (the outer loop handles it),
+            // then skip the heredoc body when we hit the newline.
+            // We store body_end and check for newline transitions below.
+            heredoc_body_end = Some(span.body_end);
+            continue;
+        }
+
+        // If we're inside a heredoc-bearing line and hit \n, skip the body.
+        if c == '\n' && let Some(body_end) = heredoc_body_end.take() {
+            i = body_end;
             continue;
         }
 
@@ -865,25 +970,25 @@ mod tests {
     #[test]
     fn heredoc_skip_helper_basic() {
         let input: Vec<char> = "<<'EOF'\nbody\nEOF\n".chars().collect();
-        let (end, quoted) = skip_heredoc(&input, 0).unwrap();
-        assert!(quoted);
-        assert_eq!(end, input.len());
+        let span = skip_heredoc(&input, 0).unwrap();
+        assert!(span.is_quoted);
+        assert_eq!(span.body_end, input.len());
     }
 
     #[test]
     fn heredoc_skip_helper_unquoted() {
         let input: Vec<char> = "<<EOF\nbody\nEOF\n".chars().collect();
-        let (end, quoted) = skip_heredoc(&input, 0).unwrap();
-        assert!(!quoted);
-        assert_eq!(end, input.len());
+        let span = skip_heredoc(&input, 0).unwrap();
+        assert!(!span.is_quoted);
+        assert_eq!(span.body_end, input.len());
     }
 
     #[test]
     fn heredoc_skip_helper_double_quoted() {
         let input: Vec<char> = "<<\"EOF\"\nbody\nEOF\n".chars().collect();
-        let (end, quoted) = skip_heredoc(&input, 0).unwrap();
-        assert!(quoted);
-        assert_eq!(end, input.len());
+        let span = skip_heredoc(&input, 0).unwrap();
+        assert!(span.is_quoted);
+        assert_eq!(span.body_end, input.len());
     }
 
     #[test]
@@ -966,5 +1071,104 @@ mod tests {
         // Now recursively parse the inner — should find NO further substitutions
         let (_, inner_subs) = extract_substitutions(&inners[0]);
         assert!(inner_subs.is_empty(), "heredoc body should not yield substitutions on recursive parse");
+    }
+
+    // ── Heredoc + pipe splitting (the pipe-swallowing bug) ──
+
+    #[test]
+    fn heredoc_pipe_splits_correctly() {
+        // The exact pattern that bypassed the gate:
+        // `cat <<'EOF' | kubectl apply -f -` should split into TWO segments
+        let cmd = "cat <<'EOF' | kubectl apply -f -\napiVersion: v1\nkind: Role\nEOF\n";
+        let (parts, ops) = split_compound_command(cmd);
+        assert_eq!(parts.len(), 2, "heredoc pipe should split into 2 parts: {parts:?}");
+        assert_eq!(ops, vec![Operator::Pipe]);
+        assert!(parts[0].starts_with("cat <<'EOF'"), "first part should be cat heredoc: {}", parts[0]);
+        assert_eq!(parts[1].trim(), "kubectl apply -f -", "second part should be kubectl: {}", parts[1]);
+    }
+
+    #[test]
+    fn heredoc_pipe_unquoted_splits_correctly() {
+        let cmd = "cat <<EOF | grep pattern\nbody line\nEOF\n";
+        let (parts, ops) = split_compound_command(cmd);
+        assert_eq!(parts.len(), 2, "unquoted heredoc pipe should split: {parts:?}");
+        assert_eq!(ops, vec![Operator::Pipe]);
+        assert_eq!(parts[1].trim(), "grep pattern");
+    }
+
+    #[test]
+    fn heredoc_and_splits_correctly() {
+        // && on same line as heredoc
+        let cmd = "cat <<'EOF' && echo done\nbody\nEOF\n";
+        let (parts, ops) = split_compound_command(cmd);
+        assert_eq!(parts.len(), 2, "heredoc && should split: {parts:?}");
+        assert_eq!(ops, vec![Operator::And]);
+        assert_eq!(parts[1].trim(), "echo done");
+    }
+
+    #[test]
+    fn heredoc_semicolon_splits_correctly() {
+        let cmd = "cat <<'EOF' ; rm -rf /\nbody\nEOF\n";
+        let (parts, ops) = split_compound_command(cmd);
+        assert_eq!(parts.len(), 2, "heredoc ; should split: {parts:?}");
+        assert_eq!(ops, vec![Operator::Semi]);
+        assert_eq!(parts[1].trim(), "rm -rf /");
+    }
+
+    #[test]
+    fn heredoc_pipe_err_splits_correctly() {
+        let cmd = "cat <<'EOF' |& grep error\nbody\nEOF\n";
+        let (parts, ops) = split_compound_command(cmd);
+        assert_eq!(parts.len(), 2, "heredoc |& should split: {parts:?}");
+        assert_eq!(ops, vec![Operator::PipeErr]);
+        assert_eq!(parts[1].trim(), "grep error");
+    }
+
+    #[test]
+    fn heredoc_or_splits_correctly() {
+        let cmd = "cat <<'EOF' || echo fallback\nbody\nEOF\n";
+        let (parts, ops) = split_compound_command(cmd);
+        assert_eq!(parts.len(), 2, "heredoc || should split: {parts:?}");
+        assert_eq!(ops, vec![Operator::Or]);
+        assert_eq!(parts[1].trim(), "echo fallback");
+    }
+
+    #[test]
+    fn heredoc_redir_on_delim_line_detected() {
+        // `cat <<'EOF' > /tmp/out` — the > is on the DELIM line, should be detected
+        let cmd = "cat <<'EOF' > /tmp/out\nbody\nEOF\n";
+        assert!(has_output_redirection(cmd).is_some(),
+            "redirection on heredoc DELIM line should be detected");
+    }
+
+    #[test]
+    fn heredoc_skip_after_delim_position() {
+        // Verify after_delim points right after the delimiter word
+        let input: Vec<char> = "<<'EOF' | kubectl apply -f -\nbody\nEOF\n".chars().collect();
+        let span = skip_heredoc(&input, 0).unwrap();
+        assert!(span.is_quoted);
+        // after_delim should be right after 'EOF' — before the space-pipe-space
+        let rest: String = input[span.after_delim..].iter().collect();
+        assert!(rest.starts_with(" | kubectl"), "rest of line after delim: {rest}");
+        assert_eq!(span.body_end, input.len());
+    }
+
+    #[test]
+    fn heredoc_body_operators_still_ignored() {
+        // Operators inside the heredoc body should NOT cause splits
+        let cmd = "cat <<'EOF'\nline && other | stuff ; more\nEOF\n";
+        let (parts, ops) = split_compound_command(cmd);
+        assert_eq!(parts.len(), 1, "body operators should not split: {parts:?}");
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn heredoc_pipe_substitutions_on_right_side() {
+        // $() on the right side of a heredoc pipe should be extracted
+        let cmd = "cat <<'EOF' | kubectl apply -f $(echo -)\nbody\nEOF\n";
+        let (outer, subs) = extract_substitutions(cmd);
+        assert_eq!(subs, vec!["echo -"], "substitution on pipe RHS should be extracted: {subs:?}");
+        // The outer should still contain the pipe
+        assert!(outer.contains('|'), "outer should contain pipe: {outer}");
     }
 }

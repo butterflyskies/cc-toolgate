@@ -1178,4 +1178,271 @@ mod tests {
         let result = registry.evaluate("ls -la && shred foo");
         assert_eq!(result.decision, Decision::Ask);
     }
+
+    // ── Heredoc pipe-swallowing regression tests ──
+    // These test the bug where `cat <<'EOF' | kubectl apply -f -` was treated
+    // as a single `cat` command (allowed) because skip_heredoc consumed the
+    // pipe operator along with the rest of the <<DELIM line.
+
+    #[test]
+    fn heredoc_pipe_kubectl_apply_asks() {
+        // The exact command that bypassed the gate in production
+        let cmd = "cat <<'EOF' | kubectl apply -f -\napiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: ai-agent\n  namespace: external-secrets\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Ask,
+            "heredoc piped to kubectl apply MUST require confirmation");
+    }
+
+    #[test]
+    fn heredoc_pipe_kubectl_delete_asks() {
+        let cmd = "cat <<'EOF' | kubectl delete -f -\napiVersion: v1\nkind: Pod\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Ask,
+            "heredoc piped to kubectl delete MUST require confirmation");
+    }
+
+    #[test]
+    fn heredoc_pipe_rm_asks() {
+        let cmd = "cat <<'EOF' | xargs rm\nfile1\nfile2\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Ask,
+            "heredoc piped to rm MUST require confirmation");
+    }
+
+    #[test]
+    fn heredoc_pipe_to_grep_allows() {
+        let cmd = "cat <<'EOF' | grep pattern\nsome text\npattern here\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Allow,
+            "heredoc piped to grep should be allowed");
+    }
+
+    #[test]
+    fn heredoc_and_dangerous_command_asks() {
+        let cmd = "cat <<'EOF' && rm -rf /tmp/test\nbody\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Ask,
+            "heredoc && rm should require confirmation");
+    }
+
+    #[test]
+    fn heredoc_semicolon_dangerous_command_asks() {
+        let cmd = "cat <<'EOF' ; kubectl delete pod foo\nbody\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Ask,
+            "heredoc ; kubectl delete should require confirmation");
+    }
+
+    #[test]
+    fn heredoc_or_dangerous_command_asks() {
+        let cmd = "cat <<'EOF' || rm -rf /\nbody\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Ask,
+            "heredoc || rm should require confirmation");
+    }
+
+    #[test]
+    fn heredoc_pipe_shred_denies() {
+        let cmd = "cat <<'EOF' | xargs shred\nfile1\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Deny,
+            "heredoc piped to shred should be denied");
+    }
+
+    #[test]
+    fn heredoc_pipe_eval_denies() {
+        let cmd = "cat <<'EOF' | eval\nmalicious command\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Deny,
+            "heredoc piped to eval should be denied");
+    }
+
+    #[test]
+    fn heredoc_unquoted_pipe_kubectl_asks() {
+        // Same bug with unquoted heredoc delimiter
+        let cmd = "cat <<EOF | kubectl apply -f -\napiVersion: v1\nkind: Secret\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Ask,
+            "unquoted heredoc piped to kubectl apply MUST require confirmation");
+    }
+
+    #[test]
+    fn heredoc_pipe_kubectl_reason_mentions_kubectl() {
+        let cmd = "cat <<'EOF' | kubectl apply -f -\napiVersion: v1\nEOF\n";
+        let r = reason_for(cmd);
+        assert!(r.contains("kubectl"), "reason should mention kubectl: {r}");
+        assert!(r.contains("|"), "reason should mention pipe operator: {r}");
+    }
+
+    #[test]
+    fn heredoc_only_no_pipe_cat_allowed() {
+        // Plain cat with heredoc (no pipe) should be allowed
+        let cmd = "cat <<'EOF'\njust printing text\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Allow,
+            "cat with heredoc and no pipe should be allowed");
+    }
+
+    // ── Wrapper command evaluation ──
+    // Wrapper commands execute their arguments as subcommands.
+    // Final decision = max(floor, wrapped_command_decision).
+
+    // xargs (allow floor)
+    #[test]
+    fn xargs_rm_asks() {
+        assert_eq!(decision_for("xargs rm -rf"), Decision::Ask,
+            "xargs wrapping rm should ask");
+    }
+
+    #[test]
+    fn xargs_shred_denies() {
+        assert_eq!(decision_for("xargs shred"), Decision::Deny,
+            "xargs wrapping shred should deny");
+    }
+
+    #[test]
+    fn xargs_grep_allows() {
+        assert_eq!(decision_for("xargs grep pattern"), Decision::Allow,
+            "xargs wrapping grep should allow");
+    }
+
+    #[test]
+    fn xargs_with_flags_rm() {
+        assert_eq!(decision_for("xargs -0 -I {} rm {}"), Decision::Ask,
+            "xargs with flags wrapping rm should ask");
+    }
+
+    // env (allow floor)
+    #[test]
+    fn env_rm_asks() {
+        assert_eq!(decision_for("env rm -rf /tmp/test"), Decision::Ask,
+            "env wrapping rm should ask");
+    }
+
+    #[test]
+    fn env_with_vars_rm_asks() {
+        assert_eq!(decision_for("env FOO=bar rm -rf /tmp/test"), Decision::Ask,
+            "env with vars wrapping rm should ask");
+    }
+
+    #[test]
+    fn env_ls_allows() {
+        assert_eq!(decision_for("env ls -la"), Decision::Allow,
+            "env wrapping ls should allow");
+    }
+
+    #[test]
+    fn env_with_vars_ls_allows() {
+        assert_eq!(decision_for("env HOME=/tmp ls -la"), Decision::Allow,
+            "env with vars wrapping ls should allow");
+    }
+
+    #[test]
+    fn env_kubectl_apply_asks() {
+        assert_eq!(decision_for("env KUBECONFIG=~/.kube/config kubectl apply -f foo.yaml"), Decision::Ask,
+            "env wrapping kubectl apply should ask");
+    }
+
+    // sudo (ask floor)
+    #[test]
+    fn sudo_ls_asks() {
+        assert_eq!(decision_for("sudo ls"), Decision::Ask,
+            "sudo wrapping ls should still ask (ask floor)");
+    }
+
+    #[test]
+    fn sudo_shred_denies() {
+        assert_eq!(decision_for("sudo shred /dev/sda"), Decision::Deny,
+            "sudo wrapping shred should deny (escalate past ask floor)");
+    }
+
+    #[test]
+    fn sudo_rm_asks() {
+        assert_eq!(decision_for("sudo rm -rf /"), Decision::Ask,
+            "sudo wrapping rm should ask");
+    }
+
+    #[test]
+    fn sudo_with_user_flag() {
+        assert_eq!(decision_for("sudo -u postgres psql"), Decision::Ask,
+            "sudo -u wrapping unrecognized command should ask");
+    }
+
+    #[test]
+    fn doas_rm_asks() {
+        assert_eq!(decision_for("doas rm -rf /"), Decision::Ask,
+            "doas wrapping rm should ask");
+    }
+
+    #[test]
+    fn doas_shred_denies() {
+        assert_eq!(decision_for("doas shred /dev/sda"), Decision::Deny,
+            "doas wrapping shred should deny");
+    }
+
+    #[test]
+    fn su_rm_asks() {
+        assert_eq!(decision_for("su -c rm"), Decision::Ask,
+            "su wrapping rm should ask");
+    }
+
+    // nohup, nice, timeout, time, watch (allow floor)
+    #[test]
+    fn nohup_rm_asks() {
+        assert_eq!(decision_for("nohup rm -rf /tmp/test"), Decision::Ask,
+            "nohup wrapping rm should ask");
+    }
+
+    #[test]
+    fn nice_ls_allows() {
+        assert_eq!(decision_for("nice -n 10 ls -la"), Decision::Allow,
+            "nice wrapping ls should allow");
+    }
+
+    #[test]
+    fn timeout_rm_asks() {
+        assert_eq!(decision_for("timeout 30 rm -rf /tmp/test"), Decision::Ask,
+            "timeout wrapping rm should ask");
+    }
+
+    #[test]
+    fn time_ls_allows() {
+        assert_eq!(decision_for("time ls -la"), Decision::Allow,
+            "time wrapping ls should allow");
+    }
+
+    #[test]
+    fn watch_kubectl_get_allows() {
+        assert_eq!(decision_for("watch kubectl get pods"), Decision::Allow,
+            "watch wrapping kubectl get should allow");
+    }
+
+    #[test]
+    fn watch_rm_asks() {
+        assert_eq!(decision_for("watch rm -rf /tmp/test"), Decision::Ask,
+            "watch wrapping rm should ask");
+    }
+
+    // parallel (allow floor)
+    #[test]
+    fn parallel_rm_asks() {
+        assert_eq!(decision_for("parallel rm"), Decision::Ask,
+            "parallel wrapping rm should ask");
+    }
+
+    #[test]
+    fn parallel_grep_allows() {
+        assert_eq!(decision_for("parallel grep pattern"), Decision::Allow,
+            "parallel wrapping grep should allow");
+    }
+
+    // Wrapper with no wrapped command
+    #[test]
+    fn bare_env_allows() {
+        // `env` alone (prints environment) is safe
+        assert_eq!(decision_for("env"), Decision::Allow,
+            "bare env should allow");
+    }
+
+    #[test]
+    fn bare_sudo_asks() {
+        assert_eq!(decision_for("sudo"), Decision::Ask,
+            "bare sudo should ask");
+    }
+
+    // Wrapper with redirection
+    #[test]
+    fn xargs_echo_redir_asks() {
+        assert_eq!(decision_for("xargs echo > /tmp/out"), Decision::Ask,
+            "xargs with redirection should ask");
+    }
 }

@@ -12,6 +12,8 @@ pub struct Config {
     #[serde(default)]
     pub commands: Commands,
     #[serde(default)]
+    pub wrappers: WrapperConfig,
+    #[serde(default)]
     pub git: GitConfig,
     #[serde(default)]
     pub cargo: CargoConfig,
@@ -35,6 +37,21 @@ pub struct Commands {
     pub ask: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+}
+
+/// Commands that execute their arguments as subcommands.
+/// The wrapped command is extracted and evaluated; the final decision
+/// is max(floor, wrapped_command_decision).
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct WrapperConfig {
+    /// Wrappers with Allow floor: wrapper is safe, wrapped command determines disposition.
+    /// e.g. xargs, parallel, env, nohup, nice, timeout, time, watch
+    #[serde(default)]
+    pub allow_floor: Vec<String>,
+    /// Wrappers with Ask floor: always at least Ask, wrapped command can escalate to Deny.
+    /// e.g. sudo, doas, pkexec
+    #[serde(default)]
+    pub ask_floor: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -94,6 +111,8 @@ struct ConfigOverlay {
     #[serde(default)]
     commands: CommandsOverlay,
     #[serde(default)]
+    wrappers: WrappersOverlay,
+    #[serde(default)]
     git: GitOverlay,
     #[serde(default)]
     cargo: CargoOverlay,
@@ -106,6 +125,20 @@ struct ConfigOverlay {
 #[derive(Debug, Deserialize, Default)]
 struct SettingsOverlay {
     escalate_deny: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct WrappersOverlay {
+    #[serde(default)]
+    replace: bool,
+    #[serde(default)]
+    allow_floor: Vec<String>,
+    #[serde(default)]
+    ask_floor: Vec<String>,
+    #[serde(default)]
+    remove_allow_floor: Vec<String>,
+    #[serde(default)]
+    remove_ask_floor: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -265,6 +298,11 @@ impl Config {
         merge_list(&mut self.commands.ask, c.ask, &c.remove_ask, c.replace);
         merge_list(&mut self.commands.deny, c.deny, &c.remove_deny, c.replace);
 
+        // Wrappers
+        let w = overlay.wrappers;
+        merge_list(&mut self.wrappers.allow_floor, w.allow_floor, &w.remove_allow_floor, w.replace);
+        merge_list(&mut self.wrappers.ask_floor, w.ask_floor, &w.remove_ask_floor, w.replace);
+
         // Git
         let g = overlay.git;
         merge_list(&mut self.git.read_only, g.read_only, &g.remove_read_only, g.replace);
@@ -366,12 +404,48 @@ mod tests {
         let mut config = Config::default_config();
         config.apply_overlay_str(r#"
             [commands]
-            remove_allow = ["xargs", "find"]
+            remove_allow = ["cat", "find"]
         "#);
-        assert!(!config.commands.allow.contains(&"xargs".to_string()));
+        assert!(!config.commands.allow.contains(&"cat".to_string()));
         assert!(!config.commands.allow.contains(&"find".to_string()));
         // Other items still present
         assert!(config.commands.allow.contains(&"ls".to_string()));
+    }
+
+    #[test]
+    fn default_wrappers_populated() {
+        let config = Config::default_config();
+        assert!(config.wrappers.allow_floor.contains(&"xargs".to_string()));
+        assert!(config.wrappers.allow_floor.contains(&"env".to_string()));
+        assert!(config.wrappers.ask_floor.contains(&"sudo".to_string()));
+        assert!(config.wrappers.ask_floor.contains(&"doas".to_string()));
+        // These should NOT be in commands.allow/ask anymore
+        assert!(!config.commands.allow.contains(&"xargs".to_string()));
+        assert!(!config.commands.allow.contains(&"env".to_string()));
+        assert!(!config.commands.ask.contains(&"sudo".to_string()));
+    }
+
+    #[test]
+    fn overlay_removes_from_wrappers() {
+        let mut config = Config::default_config();
+        config.apply_overlay_str(r#"
+            [wrappers]
+            remove_allow_floor = ["xargs"]
+        "#);
+        assert!(!config.wrappers.allow_floor.contains(&"xargs".to_string()));
+        // Others untouched
+        assert!(config.wrappers.allow_floor.contains(&"env".to_string()));
+    }
+
+    #[test]
+    fn overlay_extends_wrappers() {
+        let mut config = Config::default_config();
+        config.apply_overlay_str(r#"
+            [wrappers]
+            allow_floor = ["my-wrapper"]
+        "#);
+        assert!(config.wrappers.allow_floor.contains(&"my-wrapper".to_string()));
+        assert!(config.wrappers.allow_floor.contains(&"xargs".to_string()));
     }
 
     #[test]
