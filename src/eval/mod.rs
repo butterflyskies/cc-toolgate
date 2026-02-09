@@ -2,7 +2,7 @@ pub mod context;
 pub mod decision;
 
 pub use context::CommandContext;
-pub use decision::{BaseDisposition, Decision, FlagDisposition, RuleMatch};
+pub use decision::{Decision, RuleMatch};
 
 use std::collections::HashMap;
 

@@ -47,6 +47,9 @@ allow = [
     # Environment
     "printenv", "locale",
     # Shell builtins / control
+    # Note: source/. can execute arbitrary code. They're allowed by default
+    # because Claude Code commonly uses them for env setup. Move to ask list
+    # with remove_allow = ["source", "."] if this concerns you.
     "test", "[", "true", "false", "type", "command", "hash",
     "export", "unset", "set", "source", ".",
     "sleep", "seq", "yes",
@@ -122,6 +125,8 @@ force_push_flags = ["--force", "--force-with-lease", "-f"]
 
 [cargo]
 # Subcommands that are safe (build / check / informational).
+# Note: "run" executes arbitrary code via the project's binary/example.
+# Remove with remove_safe_subcommands = ["run"] if this concerns you.
 safe_subcommands = [
     "build", "check", "test", "bench", "run",
     "clippy", "fmt", "doc", "clean", "update",

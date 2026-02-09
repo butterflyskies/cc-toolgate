@@ -720,48 +720,10 @@ pub fn has_output_redirection(command: &str) -> Option<Redirection> {
     None
 }
 
-/// Parse a full command string into a `ParsedPipeline`.
+/// Parse a full command string into a pipeline and its top-level substitutions.
 ///
 /// Extracts substitutions first, then splits at compound operators.
-/// Each segment carries its substitutions and redirection state.
-pub fn parse(command: &str) -> ParsedPipeline {
-    let (outer, substitutions) = extract_substitutions(command);
-    let (parts, operators) = split_compound_command(&outer);
-
-    // Simple case: no compound splitting needed
-    if parts.len() <= 1 && substitutions.is_empty() {
-        let redir = has_output_redirection(command);
-        return ParsedPipeline {
-            segments: vec![ShellSegment {
-                command: command.trim().to_string(),
-                substitutions: vec![],
-                redirection: redir,
-            }],
-            operators: vec![],
-        };
-    }
-
-    let segments = parts
-        .into_iter()
-        .map(|part| {
-            let redir = has_output_redirection(&part);
-            ShellSegment {
-                command: part,
-                substitutions: vec![], // substitutions attached at pipeline level for now
-                redirection: redir,
-            }
-        })
-        .collect();
-
-    ParsedPipeline {
-        segments,
-        operators,
-    }
-}
-
-/// Parse and return both the pipeline and the top-level substitutions.
-///
-/// This is the main entry point for the evaluation layer.
+/// Each segment carries its redirection state.
 pub fn parse_with_substitutions(command: &str) -> (ParsedPipeline, Vec<String>) {
     let (outer, substitutions) = extract_substitutions(command);
     let (parts, operators) = split_compound_command(&outer);

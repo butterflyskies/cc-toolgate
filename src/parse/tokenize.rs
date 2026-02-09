@@ -32,6 +32,9 @@ pub fn base_command(command: &str) -> String {
 }
 
 /// Extract leading KEY=VALUE pairs from a command string.
+// TODO: Breaks on quoted values like FOO="bar baz" — scans for first
+// whitespace after `=` without respecting quotes. Rare in Claude Code
+// output but worth fixing eventually.
 pub fn env_vars(command: &str) -> Vec<(String, String)> {
     let mut result = Vec::new();
     let mut rest = command.trim();
