@@ -29,31 +29,3 @@ pub struct RuleMatch {
     pub reason: String,
 }
 
-/// Base disposition for a command or subcommand (what it does with no flags).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BaseDisposition {
-    Allow,
-    Ask,
-    Deny,
-}
-
-impl BaseDisposition {
-    pub fn to_decision(self) -> Decision {
-        match self {
-            BaseDisposition::Allow => Decision::Allow,
-            BaseDisposition::Ask => Decision::Ask,
-            BaseDisposition::Deny => Decision::Deny,
-        }
-    }
-}
-
-/// Per-flag disposition for known flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FlagDisposition {
-    /// Flag is safe — does not change the base disposition.
-    Safe,
-    /// Flag escalates the decision (e.g. ALLOW → ASK).
-    Escalate,
-    /// Flag is dangerous — force DENY.
-    Deny,
-}

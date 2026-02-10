@@ -13,6 +13,24 @@ struct ToolInput {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let escalate_deny = args.iter().any(|a| a == "--escalate-deny");
+
+    // --dump-config [json]: print effective config and exit
+    if let Some(pos) = args.iter().position(|a| a == "--dump-config") {
+        let config = cc_toolgate::config::Config::load();
+        let format = args.get(pos + 1).map(|s| s.as_str());
+        match format {
+            Some("json") => {
+                println!("{}", serde_json::to_string_pretty(&config).unwrap());
+            }
+            _ => {
+                println!("{}", toml::to_string_pretty(&config).unwrap());
+            }
+        }
+        return;
+    }
+
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
         eprintln!("failed to read stdin");
@@ -43,7 +61,13 @@ fn main() {
     // Init logging (best-effort, no-op on failure)
     cc_toolgate::logging::init();
 
-    let result = cc_toolgate::evaluate(&command);
+    // Load config (user override or embedded defaults) and build registry
+    let config = cc_toolgate::config::Config::load();
+    let mut registry = cc_toolgate::eval::CommandRegistry::from_config(&config);
+    if escalate_deny {
+        registry.set_escalate_deny(true);
+    }
+    let result = registry.evaluate(&command);
 
     // Log decision to ~/.local/share/cc-toolgate/decisions.log
     cc_toolgate::logging::log_decision(&command, &result);
@@ -129,35 +153,33 @@ mod tests {
     }
 
     #[test]
-    fn allow_git_push_with_config() {
+    fn allow_git_status() {
+        assert_eq!(decision_for("git status"), Decision::Allow);
+    }
+
+    #[test]
+    fn ask_git_push() {
+        // Default config has no env-gated commands — push always asks
+        assert_eq!(decision_for("git push origin main"), Decision::Ask);
+    }
+
+    #[test]
+    fn ask_git_push_with_env() {
+        // Default config has empty config_env_var — env var doesn't help
         assert_eq!(
             decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push origin main"),
-            Decision::Allow
+            Decision::Ask
         );
     }
 
     #[test]
-    fn allow_git_pull_with_config() {
-        assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git pull origin main"),
-            Decision::Allow
-        );
+    fn ask_git_pull() {
+        assert_eq!(decision_for("git pull origin main"), Decision::Ask);
     }
 
     #[test]
-    fn allow_git_status_with_config() {
-        assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git status"),
-            Decision::Allow
-        );
-    }
-
-    #[test]
-    fn allow_git_add_with_config() {
-        assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git add ."),
-            Decision::Allow
-        );
+    fn ask_git_add() {
+        assert_eq!(decision_for("git add ."), Decision::Ask);
     }
 
     #[test]
@@ -451,19 +473,9 @@ mod tests {
     }
 
     #[test]
-    fn ask_git_push_no_config() {
-        assert_eq!(decision_for("git push origin main"), Decision::Ask);
-    }
-
-    #[test]
-    fn ask_git_pull_no_config() {
-        assert_eq!(decision_for("git pull origin main"), Decision::Ask);
-    }
-
-    #[test]
     fn ask_force_push() {
         assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push --force origin main"),
+            decision_for("git push --force origin main"),
             Decision::Ask
         );
     }
@@ -471,7 +483,7 @@ mod tests {
     #[test]
     fn ask_force_push_short_flag() {
         assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push -f origin main"),
+            decision_for("git push -f origin main"),
             Decision::Ask
         );
     }
@@ -479,19 +491,14 @@ mod tests {
     #[test]
     fn ask_force_push_with_lease() {
         assert_eq!(
-            decision_for(
-                "GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push --force-with-lease origin main"
-            ),
+            decision_for("git push --force-with-lease origin main"),
             Decision::Ask
         );
     }
 
     #[test]
     fn ask_git_commit() {
-        assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git commit -m 'test'"),
-            Decision::Ask
-        );
+        assert_eq!(decision_for("git commit -m 'test'"), Decision::Ask);
     }
 
     #[test]
@@ -559,10 +566,7 @@ mod tests {
 
     #[test]
     fn redir_git_status() {
-        assert_eq!(
-            decision_for("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git status > /tmp/s.txt"),
-            Decision::Ask
-        );
+        assert_eq!(decision_for("git status > /tmp/s.txt"), Decision::Ask);
     }
 
     #[test]
@@ -885,6 +889,32 @@ mod tests {
         assert_eq!(decision_for("git log > /tmp/log.txt"), Decision::Ask);
     }
 
+    // ── git -C (change directory) ──
+
+    #[test]
+    fn allow_git_c_status() {
+        assert_eq!(
+            decision_for("git -C /var/home/user/repo status"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn allow_git_c_log() {
+        assert_eq!(
+            decision_for("git -C ../other-repo log --oneline -5"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn ask_git_c_push() {
+        assert_eq!(
+            decision_for("git -C /some/repo push origin main"),
+            Decision::Ask
+        );
+    }
+
     // ── gh CLI read-only ──
 
     #[test]
@@ -1009,5 +1039,410 @@ mod tests {
     #[test]
     fn chain_cd_and_ls() {
         assert_eq!(decision_for("cd /tmp && ls -la"), Decision::Allow);
+    }
+
+    // ── escalate_deny ──
+
+    #[test]
+    fn escalate_deny_turns_deny_to_ask() {
+        let config = cc_toolgate::config::Config::default_config();
+        let mut registry = cc_toolgate::eval::CommandRegistry::from_config(&config);
+        registry.set_escalate_deny(true);
+        let result = registry.evaluate("shred /dev/sda");
+        assert_eq!(result.decision, Decision::Ask);
+        assert!(result.reason.contains("escalated from deny"));
+    }
+
+    #[test]
+    fn escalate_deny_does_not_affect_allow() {
+        let config = cc_toolgate::config::Config::default_config();
+        let mut registry = cc_toolgate::eval::CommandRegistry::from_config(&config);
+        registry.set_escalate_deny(true);
+        let result = registry.evaluate("ls -la");
+        assert_eq!(result.decision, Decision::Allow);
+    }
+
+    #[test]
+    fn escalate_deny_does_not_affect_ask() {
+        let config = cc_toolgate::config::Config::default_config();
+        let mut registry = cc_toolgate::eval::CommandRegistry::from_config(&config);
+        registry.set_escalate_deny(true);
+        let result = registry.evaluate("rm -rf /tmp");
+        assert_eq!(result.decision, Decision::Ask);
+    }
+
+    // ── heredoc ──
+
+    #[test]
+    fn heredoc_gh_pr_create_with_markdown() {
+        // Reproduces the original bug: markdown backticks in a heredoc
+        // body were extracted as command substitutions (21 of them!)
+        let cmd = "gh pr create --title \"Fix\" --body \"$(cat <<'EOF'\n## Summary\n- **New:** `config.rs`\n- **Changed:** `eval/mod.rs`\nEOF\n)\"";
+        assert_eq!(decision_for(cmd), Decision::Ask);
+        let r = reason_for(cmd);
+        // Should have exactly 1 substitution (the outer $(cat ...)), NOT 21
+        assert!(
+            r.contains("1 substitution(s)"),
+            "should have 1 substitution, not many: {r}"
+        );
+        // Should NOT contain "unrecognized command" from false backtick extraction
+        assert!(
+            !r.contains("unrecognized command"),
+            "heredoc body should not produce unrecognized commands: {r}"
+        );
+    }
+
+    #[test]
+    fn heredoc_git_commit_with_body() {
+        let cmd = "git commit -m \"$(cat <<'EOF'\nFix bug in `parse/shell.rs`\n\nCo-Authored-By: Claude\nEOF\n)\"";
+        assert_eq!(decision_for(cmd), Decision::Ask);
+        let r = reason_for(cmd);
+        assert!(
+            r.contains("1 substitution(s)"),
+            "should have 1 substitution, not many: {r}"
+        );
+        assert!(
+            !r.contains("unrecognized command"),
+            "heredoc body should not produce unrecognized commands: {r}"
+        );
+    }
+
+    // ── /dev/null redirection (non-mutating) ──
+
+    #[test]
+    fn allow_ls_devnull() {
+        assert_eq!(decision_for("ls -la > /dev/null"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_ls_devnull_stderr() {
+        assert_eq!(decision_for("ls -la 2> /dev/null"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_ls_devnull_combined() {
+        assert_eq!(decision_for("ls -la &> /dev/null"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_cargo_test_devnull() {
+        assert_eq!(
+            decision_for("cargo test 2> /dev/null"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn allow_git_status_devnull() {
+        assert_eq!(
+            decision_for("git status > /dev/null"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn ask_ls_devnull_plus_file() {
+        // stdout to file AND stderr to /dev/null — still mutating
+        assert_eq!(
+            decision_for("ls -la > /tmp/out 2> /dev/null"),
+            Decision::Ask
+        );
+    }
+
+    // ── Custom fd duplication safety ──
+
+    #[test]
+    fn fd_dup_to_custom_fd_asks() {
+        // >&3 could write to a file — not safe
+        assert_eq!(decision_for("ls -la >&3"), Decision::Ask);
+    }
+
+    #[test]
+    fn fd_dup_stderr_to_custom_fd_asks() {
+        // 2>&3 could write to a file
+        assert_eq!(decision_for("ls -la 2>&3"), Decision::Ask);
+    }
+
+    #[test]
+    fn fd_dup_to_standard_fd_allows() {
+        // >&2 is always safe
+        assert_eq!(decision_for("ls -la >&2"), Decision::Allow);
+    }
+
+    #[test]
+    fn escalate_deny_compound() {
+        let config = cc_toolgate::config::Config::default_config();
+        let mut registry = cc_toolgate::eval::CommandRegistry::from_config(&config);
+        registry.set_escalate_deny(true);
+        // With escalation, shred goes from Deny→Ask, so worst is Ask (not Deny)
+        let result = registry.evaluate("ls -la && shred foo");
+        assert_eq!(result.decision, Decision::Ask);
+    }
+
+    // ── Heredoc pipe-swallowing regression tests ──
+    // These test the bug where `cat <<'EOF' | kubectl apply -f -` was treated
+    // as a single `cat` command (allowed) because skip_heredoc consumed the
+    // pipe operator along with the rest of the <<DELIM line.
+
+    #[test]
+    fn heredoc_pipe_kubectl_apply_asks() {
+        // The exact command that bypassed the gate in production
+        let cmd = "cat <<'EOF' | kubectl apply -f -\napiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nmetadata:\n  name: ai-agent\n  namespace: external-secrets\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Ask,
+            "heredoc piped to kubectl apply MUST require confirmation");
+    }
+
+    #[test]
+    fn heredoc_pipe_kubectl_delete_asks() {
+        let cmd = "cat <<'EOF' | kubectl delete -f -\napiVersion: v1\nkind: Pod\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Ask,
+            "heredoc piped to kubectl delete MUST require confirmation");
+    }
+
+    #[test]
+    fn heredoc_pipe_rm_asks() {
+        let cmd = "cat <<'EOF' | xargs rm\nfile1\nfile2\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Ask,
+            "heredoc piped to rm MUST require confirmation");
+    }
+
+    #[test]
+    fn heredoc_pipe_to_grep_allows() {
+        let cmd = "cat <<'EOF' | grep pattern\nsome text\npattern here\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Allow,
+            "heredoc piped to grep should be allowed");
+    }
+
+    #[test]
+    fn heredoc_and_dangerous_command_asks() {
+        let cmd = "cat <<'EOF' && rm -rf /tmp/test\nbody\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Ask,
+            "heredoc && rm should require confirmation");
+    }
+
+    #[test]
+    fn heredoc_semicolon_dangerous_command_asks() {
+        let cmd = "cat <<'EOF' ; kubectl delete pod foo\nbody\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Ask,
+            "heredoc ; kubectl delete should require confirmation");
+    }
+
+    #[test]
+    fn heredoc_or_dangerous_command_asks() {
+        let cmd = "cat <<'EOF' || rm -rf /\nbody\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Ask,
+            "heredoc || rm should require confirmation");
+    }
+
+    #[test]
+    fn heredoc_pipe_shred_denies() {
+        let cmd = "cat <<'EOF' | xargs shred\nfile1\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Deny,
+            "heredoc piped to shred should be denied");
+    }
+
+    #[test]
+    fn heredoc_pipe_eval_denies() {
+        let cmd = "cat <<'EOF' | eval\nmalicious command\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Deny,
+            "heredoc piped to eval should be denied");
+    }
+
+    #[test]
+    fn heredoc_unquoted_pipe_kubectl_asks() {
+        // Same bug with unquoted heredoc delimiter
+        let cmd = "cat <<EOF | kubectl apply -f -\napiVersion: v1\nkind: Secret\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Ask,
+            "unquoted heredoc piped to kubectl apply MUST require confirmation");
+    }
+
+    #[test]
+    fn heredoc_pipe_kubectl_reason_mentions_kubectl() {
+        let cmd = "cat <<'EOF' | kubectl apply -f -\napiVersion: v1\nEOF\n";
+        let r = reason_for(cmd);
+        assert!(r.contains("kubectl"), "reason should mention kubectl: {r}");
+        assert!(r.contains("|"), "reason should mention pipe operator: {r}");
+    }
+
+    #[test]
+    fn heredoc_only_no_pipe_cat_allowed() {
+        // Plain cat with heredoc (no pipe) should be allowed
+        let cmd = "cat <<'EOF'\njust printing text\nEOF\n";
+        assert_eq!(decision_for(cmd), Decision::Allow,
+            "cat with heredoc and no pipe should be allowed");
+    }
+
+    // ── Wrapper command evaluation ──
+    // Wrapper commands execute their arguments as subcommands.
+    // Final decision = max(floor, wrapped_command_decision).
+
+    // xargs (allow floor)
+    #[test]
+    fn xargs_rm_asks() {
+        assert_eq!(decision_for("xargs rm -rf"), Decision::Ask,
+            "xargs wrapping rm should ask");
+    }
+
+    #[test]
+    fn xargs_shred_denies() {
+        assert_eq!(decision_for("xargs shred"), Decision::Deny,
+            "xargs wrapping shred should deny");
+    }
+
+    #[test]
+    fn xargs_grep_allows() {
+        assert_eq!(decision_for("xargs grep pattern"), Decision::Allow,
+            "xargs wrapping grep should allow");
+    }
+
+    #[test]
+    fn xargs_with_flags_rm() {
+        assert_eq!(decision_for("xargs -0 -I {} rm {}"), Decision::Ask,
+            "xargs with flags wrapping rm should ask");
+    }
+
+    // env (allow floor)
+    #[test]
+    fn env_rm_asks() {
+        assert_eq!(decision_for("env rm -rf /tmp/test"), Decision::Ask,
+            "env wrapping rm should ask");
+    }
+
+    #[test]
+    fn env_with_vars_rm_asks() {
+        assert_eq!(decision_for("env FOO=bar rm -rf /tmp/test"), Decision::Ask,
+            "env with vars wrapping rm should ask");
+    }
+
+    #[test]
+    fn env_ls_allows() {
+        assert_eq!(decision_for("env ls -la"), Decision::Allow,
+            "env wrapping ls should allow");
+    }
+
+    #[test]
+    fn env_with_vars_ls_allows() {
+        assert_eq!(decision_for("env HOME=/tmp ls -la"), Decision::Allow,
+            "env with vars wrapping ls should allow");
+    }
+
+    #[test]
+    fn env_kubectl_apply_asks() {
+        assert_eq!(decision_for("env KUBECONFIG=~/.kube/config kubectl apply -f foo.yaml"), Decision::Ask,
+            "env wrapping kubectl apply should ask");
+    }
+
+    // sudo (ask floor)
+    #[test]
+    fn sudo_ls_asks() {
+        assert_eq!(decision_for("sudo ls"), Decision::Ask,
+            "sudo wrapping ls should still ask (ask floor)");
+    }
+
+    #[test]
+    fn sudo_shred_denies() {
+        assert_eq!(decision_for("sudo shred /dev/sda"), Decision::Deny,
+            "sudo wrapping shred should deny (escalate past ask floor)");
+    }
+
+    #[test]
+    fn sudo_rm_asks() {
+        assert_eq!(decision_for("sudo rm -rf /"), Decision::Ask,
+            "sudo wrapping rm should ask");
+    }
+
+    #[test]
+    fn sudo_with_user_flag() {
+        assert_eq!(decision_for("sudo -u postgres psql"), Decision::Ask,
+            "sudo -u wrapping unrecognized command should ask");
+    }
+
+    #[test]
+    fn doas_rm_asks() {
+        assert_eq!(decision_for("doas rm -rf /"), Decision::Ask,
+            "doas wrapping rm should ask");
+    }
+
+    #[test]
+    fn doas_shred_denies() {
+        assert_eq!(decision_for("doas shred /dev/sda"), Decision::Deny,
+            "doas wrapping shred should deny");
+    }
+
+    #[test]
+    fn su_rm_asks() {
+        assert_eq!(decision_for("su -c rm"), Decision::Ask,
+            "su wrapping rm should ask");
+    }
+
+    // nohup, nice, timeout, time, watch (allow floor)
+    #[test]
+    fn nohup_rm_asks() {
+        assert_eq!(decision_for("nohup rm -rf /tmp/test"), Decision::Ask,
+            "nohup wrapping rm should ask");
+    }
+
+    #[test]
+    fn nice_ls_allows() {
+        assert_eq!(decision_for("nice -n 10 ls -la"), Decision::Allow,
+            "nice wrapping ls should allow");
+    }
+
+    #[test]
+    fn timeout_rm_asks() {
+        assert_eq!(decision_for("timeout 30 rm -rf /tmp/test"), Decision::Ask,
+            "timeout wrapping rm should ask");
+    }
+
+    #[test]
+    fn time_ls_allows() {
+        assert_eq!(decision_for("time ls -la"), Decision::Allow,
+            "time wrapping ls should allow");
+    }
+
+    #[test]
+    fn watch_kubectl_get_allows() {
+        assert_eq!(decision_for("watch kubectl get pods"), Decision::Allow,
+            "watch wrapping kubectl get should allow");
+    }
+
+    #[test]
+    fn watch_rm_asks() {
+        assert_eq!(decision_for("watch rm -rf /tmp/test"), Decision::Ask,
+            "watch wrapping rm should ask");
+    }
+
+    // parallel (allow floor)
+    #[test]
+    fn parallel_rm_asks() {
+        assert_eq!(decision_for("parallel rm"), Decision::Ask,
+            "parallel wrapping rm should ask");
+    }
+
+    #[test]
+    fn parallel_grep_allows() {
+        assert_eq!(decision_for("parallel grep pattern"), Decision::Allow,
+            "parallel wrapping grep should allow");
+    }
+
+    // Wrapper with no wrapped command
+    #[test]
+    fn bare_env_allows() {
+        // `env` alone (prints environment) is safe
+        assert_eq!(decision_for("env"), Decision::Allow,
+            "bare env should allow");
+    }
+
+    #[test]
+    fn bare_sudo_asks() {
+        assert_eq!(decision_for("sudo"), Decision::Ask,
+            "bare sudo should ask");
+    }
+
+    // Wrapper with redirection
+    #[test]
+    fn xargs_echo_redir_asks() {
+        assert_eq!(decision_for("xargs echo > /tmp/out"), Decision::Ask,
+            "xargs with redirection should ask");
     }
 }

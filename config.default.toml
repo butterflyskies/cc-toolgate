@@ -1,0 +1,202 @@
+# cc-toolgate default configuration
+#
+# User config at ~/.config/cc-toolgate/config.toml merges with these defaults.
+#
+# Merge behavior:
+#   - Lists: user values extend defaults (no duplicates)
+#   - Scalars: user values override defaults
+#   - remove_<field> = [...]: subtract items from default lists
+#   - replace = true: in any section, replaces defaults entirely
+#
+# Example user config (only specify what you want to change):
+#
+#   [git]
+#   allowed_with_config = ["commit", "add", "push"]
+#   config_env_var = "GIT_CONFIG_GLOBAL"
+#
+#   [commands]
+#   remove_deny = ["eval"]          # move eval from deny to ask
+#   ask = ["eval"]
+#
+# To use --escalate-deny, pass it as a CLI argument in your hook config.
+# This turns all DENY decisions into ASK, so you get prompted instead
+# of hard-blocked.
+
+[settings]
+# When true, DENY decisions are escalated to ASK (user gets prompted).
+# Override via --escalate-deny CLI flag. Default: false.
+escalate_deny = false
+
+[commands]
+# Simple commands: flat name → disposition. No subcommand logic.
+# Redirection on "allow" commands escalates to "ask" automatically.
+allow = [
+    "ls", "tree", "which", "cd", "chdir", "pwd",
+    # File reading
+    "cat", "head", "tail", "less", "more",
+    # Text output
+    "echo", "printf",
+    # Text processing (read-only)
+    "grep", "sort", "uniq", "diff", "comm", "tr", "cut", "rev", "wc",
+    "column", "paste", "expand", "unexpand", "fold", "fmt", "nl",
+    # File/path info
+    "stat", "file", "dirname", "basename", "realpath", "readlink",
+    # System info
+    "uname", "hostname", "id", "whoami", "groups", "nproc",
+    "uptime", "arch", "date", "free", "df", "du", "lsblk",
+    # Environment
+    "printenv", "locale",
+    # Shell builtins / control
+    # Note: source/. can execute arbitrary code. They're allowed by default
+    # because Claude Code commonly uses them for env setup. Move to ask list
+    # with remove_allow = ["source", "."] if this concerns you.
+    "test", "[", "true", "false", "type", "command", "hash",
+    "export", "unset", "set", "source", ".",
+    "sleep", "seq", "yes",
+    # Process inspection
+    "ps", "top", "htop", "pgrep",
+    # Directory listing
+    "find",
+    # Misc safe
+    "clear", "tput", "reset",
+    # Rust CLI tools
+    "eza", "bat", "fd", "rg", "sd", "dust", "procs",
+    "tokei", "delta", "zoxide", "hyperfine", "just",
+]
+
+ask = [
+    "rm", "rmdir",
+    "mkdir", "touch",
+    "mv", "cp", "ln",
+    "chmod", "chown", "chgrp",
+    "tee",
+    "curl", "wget",
+    "pip", "pip3", "npm", "npx", "yarn", "pnpm",
+    "python", "python3", "node", "ruby", "perl",
+    "make", "cmake", "ninja",
+]
+
+deny = [
+    "shred",
+    "dd",
+    "mkfs", "fdisk", "parted",
+    "shutdown", "reboot", "halt", "poweroff",
+    "eval",
+]
+
+[wrappers]
+# Commands that execute their arguments as subcommands.
+# The wrapped command is extracted (skipping wrapper flags) and evaluated.
+# Final decision = max(floor, wrapped_command_decision).
+#
+# allow_floor: wrapper itself is safe; the wrapped command determines disposition.
+# ask_floor: wrapper always requires at least confirmation; wrapped command can escalate.
+allow_floor = [
+    "xargs", "parallel",
+    "env",
+    "nohup", "nice", "timeout", "time", "watch",
+    "strace", "ltrace",
+]
+
+ask_floor = [
+    "sudo", "su", "doas", "pkexec",
+]
+
+[git]
+# Subcommands allowed without AI gitconfig (read-only, safe).
+read_only = [
+    "status", "log", "diff", "show", "branch", "tag", "remote",
+    "rev-parse", "ls-files", "ls-tree", "shortlog",
+    "blame", "describe", "stash",
+]
+
+# Subcommands auto-allowed only when `config_env_var` is present.
+# Empty by default — enable in your custom config if you use a separate
+# AI gitconfig (e.g. GIT_CONFIG_GLOBAL=~/.gitconfig.ai).
+#
+# Example custom config to enable:
+#   allowed_with_config = ["push", "pull", "add"]
+#   config_env_var = "GIT_CONFIG_GLOBAL"
+allowed_with_config = []
+config_env_var = ""
+
+# Flags that escalate push to ASK regardless of config.
+force_push_flags = ["--force", "--force-with-lease", "-f"]
+
+[cargo]
+# Subcommands that are safe (build / check / informational).
+# Note: "run" executes arbitrary code via the project's binary/example.
+# Remove with remove_safe_subcommands = ["run"] if this concerns you.
+safe_subcommands = [
+    "build", "check", "test", "bench", "run",
+    "clippy", "fmt", "doc", "clean", "update",
+    "fetch", "tree", "metadata", "version",
+    "verify-project", "search", "generate-lockfile",
+]
+
+# Subcommands auto-allowed only when `config_env_var` is present.
+# Example: allowed_with_config = ["install"]
+#          config_env_var = "CARGO_INSTALL_ROOT"
+allowed_with_config = []
+config_env_var = ""
+
+[kubectl]
+read_only = [
+    "get", "describe", "logs", "top", "explain",
+    "api-resources", "api-versions", "version", "cluster-info",
+]
+
+mutating = [
+    "apply", "delete", "rollout", "scale", "autoscale",
+    "patch", "replace", "create", "edit",
+    "drain", "cordon", "uncordon", "taint",
+    "exec", "run", "port-forward", "cp",
+]
+
+# Subcommands auto-allowed only when `config_env_var` is present.
+# Example: allowed_with_config = ["apply", "rollout"]
+#          config_env_var = "KUBECONFIG"
+allowed_with_config = []
+config_env_var = ""
+
+[gh]
+# Two-word subcommands (e.g. "pr list") and one-word (e.g. "status").
+read_only = [
+    "status",
+    "repo view", "repo list", "repo clone",
+    "pr list", "pr view", "pr diff", "pr checks", "pr status",
+    "issue list", "issue view", "issue status",
+    "run list", "run view", "run watch",
+    "workflow list", "workflow view",
+    "release list", "release view",
+    "search", "browse", "api",
+    "auth status", "auth token",
+    "extension list",
+    "label list",
+    "cache list",
+    "variable list", "variable get",
+    "secret list",
+]
+
+mutating = [
+    "repo create", "repo delete", "repo edit", "repo fork", "repo rename", "repo archive",
+    "pr create", "pr merge", "pr close", "pr reopen", "pr comment", "pr review", "pr edit",
+    "issue create", "issue close", "issue reopen", "issue comment", "issue edit",
+    "issue delete", "issue transfer", "issue pin", "issue unpin",
+    "run rerun", "run cancel", "run delete",
+    "workflow enable", "workflow disable", "workflow run",
+    "release create", "release delete", "release edit",
+    "auth login", "auth logout", "auth refresh",
+    "extension install", "extension remove", "extension upgrade",
+    "label create", "label edit", "label delete",
+    "cache delete",
+    "variable set", "variable delete",
+    "secret set", "secret delete",
+    "config set",
+]
+
+# Subcommands auto-allowed only when `config_env_var` is present.
+# Example: allowed_with_config = ["pr create", "pr merge"]
+#          config_env_var = "GH_TOKEN"
+allowed_with_config = []
+config_env_var = ""
