@@ -1,21 +1,16 @@
 //! Command evaluation specs: per-tool logic for deciding allow/ask/deny.
 //!
-//! Each command family (git, cargo, kubectl, gh) has its own `CommandSpec`
-//! implementation with subcommand-aware evaluation. Simple commands use
-//! `SimpleCommandSpec` for flat name → decision mapping.
+//! This module contains the `CommandSpec` trait and two categories of implementation:
+//!
+//! - **`simple`** — A data-driven spec for flat command lists (allow/ask/deny with no
+//!   subcommand awareness).
+//! - **`tools`** — Subcommand-aware evaluators for specific CLI tools (git, cargo, kubectl, gh),
+//!   each with config-driven classification, env-gated auto-allow, and redirection escalation.
 
-/// Subcommand-aware cargo evaluation (build → allow, install → ask, etc.).
-pub mod cargo;
-/// Unconditional deny spec for destructive commands (shred, dd, mkfs, etc.).
-pub mod deny;
-/// Subcommand-aware GitHub CLI evaluation (pr list → allow, pr create → ask, etc.).
-pub mod gh;
-/// Subcommand-aware git evaluation with env-gating and force-push detection.
-pub mod git;
-/// Subcommand-aware kubectl evaluation (get → allow, apply → ask, etc.).
-pub mod kubectl;
 /// Data-driven spec for flat allow/ask/deny command lists.
 pub mod simple;
+/// Subcommand-aware evaluators for specific CLI tools.
+pub mod tools;
 
 use crate::eval::{CommandContext, RuleMatch};
 

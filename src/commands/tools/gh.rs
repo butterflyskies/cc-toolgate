@@ -4,7 +4,7 @@
 //! two-word form and one-word fallback are checked against the config lists.
 //! Supports env-gated auto-allow and redirection escalation.
 
-use crate::commands::CommandSpec;
+use super::super::CommandSpec;
 use crate::config::GhConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
 

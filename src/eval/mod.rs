@@ -39,15 +39,18 @@ impl CommandRegistry {
     /// Build the registry from configuration.
     pub fn from_config(config: &Config) -> Self {
         use crate::commands::{
-            cargo::CargoSpec, deny::DenyCommandSpec, gh::GhSpec, git::GitSpec,
-            kubectl::KubectlSpec, simple::SimpleCommandSpec,
+            simple::SimpleCommandSpec,
+            tools::{cargo::CargoSpec, gh::GhSpec, git::GitSpec, kubectl::KubectlSpec},
         };
 
         let mut specs: HashMap<String, Box<dyn CommandSpec>> = HashMap::new();
 
         // Deny commands (registered first, complex specs override if needed)
         for name in &config.commands.deny {
-            specs.insert(name.clone(), Box::new(DenyCommandSpec));
+            specs.insert(
+                name.clone(),
+                Box::new(SimpleCommandSpec::new(Decision::Deny)),
+            );
         }
 
         // Allow commands

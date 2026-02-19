@@ -3,7 +3,7 @@
 //! Distinguishes safe subcommands (build, test, clippy) from mutating ones
 //! (install, publish). Supports env-gated auto-allow and `--version`/`-V` detection.
 
-use crate::commands::CommandSpec;
+use super::super::CommandSpec;
 use crate::config::CargoConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
 

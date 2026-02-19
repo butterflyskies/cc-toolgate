@@ -4,7 +4,7 @@
 //! subcommand, distinguishes read-only from mutating operations, supports
 //! env-gated auto-allow for configured subcommands, and detects force-push flags.
 
-use crate::commands::CommandSpec;
+use super::super::CommandSpec;
 use crate::config::GitConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
 

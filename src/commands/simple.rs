@@ -79,4 +79,11 @@ mod tests {
         let ctx = CommandContext::from_command("rm -rf /tmp");
         assert_eq!(spec.evaluate(&ctx).decision, Decision::Ask);
     }
+
+    #[test]
+    fn deny_simple() {
+        let spec = SimpleCommandSpec::new(Decision::Deny);
+        let ctx = CommandContext::from_command("shred /dev/sda");
+        assert_eq!(spec.evaluate(&ctx).decision, Decision::Deny);
+    }
 }

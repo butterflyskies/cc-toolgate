@@ -4,7 +4,7 @@
 //! (apply, delete, scale). Supports env-gated auto-allow for subcommands
 //! like `apply` when a specific `KUBECONFIG` is set.
 
-use crate::commands::CommandSpec;
+use super::super::CommandSpec;
 use crate::config::KubectlConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
 
