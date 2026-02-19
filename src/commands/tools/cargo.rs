@@ -1,14 +1,30 @@
-use crate::commands::CommandSpec;
+//! Subcommand-aware cargo evaluation.
+//!
+//! Distinguishes safe subcommands (build, test, clippy) from mutating ones
+//! (install, publish). Supports env-gated auto-allow and `--version`/`-V` detection.
+
+use super::super::CommandSpec;
 use crate::config::CargoConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
 
+/// Subcommand-aware cargo evaluator.
+///
+/// Evaluation order:
+/// 1. Safe subcommands → ALLOW (with redirection escalation)
+/// 2. Env-gated subcommands → ALLOW if env var present, else ASK
+/// 3. `--version` / `-V` → ALLOW
+/// 4. Everything else → ASK
 pub struct CargoSpec {
+    /// Subcommands that are always safe (e.g. `build`, `test`, `check`).
     safe_subcommands: Vec<String>,
+    /// Subcommands allowed only when `config_env_var` is present.
     allowed_with_config: Vec<String>,
+    /// Env var name that gates `allowed_with_config` subcommands.
     config_env_var: String,
 }
 
 impl CargoSpec {
+    /// Build a cargo spec from configuration.
     pub fn from_config(config: &CargoConfig) -> Self {
         Self {
             safe_subcommands: config.safe_subcommands.clone(),

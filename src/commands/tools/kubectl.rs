@@ -1,15 +1,33 @@
-use crate::commands::CommandSpec;
+//! Subcommand-aware kubectl evaluation.
+//!
+//! Distinguishes read-only subcommands (get, describe, logs) from mutating ones
+//! (apply, delete, scale). Supports env-gated auto-allow for subcommands
+//! like `apply` when a specific `KUBECONFIG` is set.
+
+use super::super::CommandSpec;
 use crate::config::KubectlConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
 
+/// Subcommand-aware kubectl evaluator.
+///
+/// Evaluation order:
+/// 1. Read-only subcommands → ALLOW (with redirection escalation)
+/// 2. Env-gated subcommands → ALLOW if env var present, else ASK
+/// 3. Known mutating subcommands → ASK
+/// 4. Everything else → ASK
 pub struct KubectlSpec {
+    /// Subcommands that are always allowed (e.g. `get`, `describe`, `logs`).
     read_only: Vec<String>,
+    /// Known mutating subcommands that always require confirmation.
     mutating: Vec<String>,
+    /// Subcommands allowed only when `config_env_var` is present.
     allowed_with_config: Vec<String>,
+    /// Env var name that gates `allowed_with_config` subcommands.
     config_env_var: String,
 }
 
 impl KubectlSpec {
+    /// Build a kubectl spec from configuration.
     pub fn from_config(config: &KubectlConfig) -> Self {
         Self {
             read_only: config.read_only.clone(),
@@ -155,7 +173,10 @@ mod tests {
 
     #[test]
     fn env_gate_apply_no_config() {
-        assert_eq!(eval_with_env_gate("kubectl apply -f deploy.yaml"), Decision::Ask);
+        assert_eq!(
+            eval_with_env_gate("kubectl apply -f deploy.yaml"),
+            Decision::Ask
+        );
     }
 
     #[test]

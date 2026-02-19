@@ -1,4 +1,13 @@
+//! Evaluation engine: builds a command registry from config and evaluates commands.
+//!
+//! The [`CommandRegistry`](crate::eval::CommandRegistry) is the central evaluation structure. It maps command
+//! names to [`CommandSpec`](crate::commands::CommandSpec) implementations and
+//! handles compound command decomposition, substitution evaluation, wrapper
+//! command unwrapping, and decision aggregation.
+
+/// Per-segment evaluation context (base command, args, env vars, redirections).
 pub mod context;
+/// Decision enum and rule match types.
 pub mod decision;
 
 pub use context::CommandContext;
@@ -11,11 +20,18 @@ use crate::config::Config;
 use crate::parse;
 
 /// Registry of all command specs, keyed by command name.
+///
+/// Built from [`Config`] via [`from_config`](Self::from_config).
+/// Handles single-command evaluation, compound command decomposition,
+/// wrapper command unwrapping, substitution evaluation, and decision aggregation.
 pub struct CommandRegistry {
+    /// Command name → evaluation spec (git, cargo, kubectl, gh, simple, deny).
     specs: HashMap<String, Box<dyn CommandSpec>>,
-    /// Wrapper commands: name → floor decision.
-    /// These execute their arguments as subcommands (e.g. xargs, sudo, env).
+    /// Wrapper commands (e.g. `xargs`, `sudo`, `env`) → floor decision.
+    /// These execute their arguments as subcommands and are handled
+    /// separately from regular specs.
     wrappers: HashMap<String, Decision>,
+    /// When true, DENY decisions are escalated to ASK.
     escalate_deny: bool,
 }
 
@@ -23,35 +39,46 @@ impl CommandRegistry {
     /// Build the registry from configuration.
     pub fn from_config(config: &Config) -> Self {
         use crate::commands::{
-            cargo::CargoSpec,
-            deny::DenyCommandSpec,
-            gh::GhSpec,
-            git::GitSpec,
-            kubectl::KubectlSpec,
             simple::SimpleCommandSpec,
+            tools::{cargo::CargoSpec, gh::GhSpec, git::GitSpec, kubectl::KubectlSpec},
         };
 
         let mut specs: HashMap<String, Box<dyn CommandSpec>> = HashMap::new();
 
         // Deny commands (registered first, complex specs override if needed)
         for name in &config.commands.deny {
-            specs.insert(name.clone(), Box::new(DenyCommandSpec));
+            specs.insert(
+                name.clone(),
+                Box::new(SimpleCommandSpec::new(Decision::Deny)),
+            );
         }
 
         // Allow commands
         for name in &config.commands.allow {
-            specs.insert(name.clone(), Box::new(SimpleCommandSpec::new(Decision::Allow)));
+            specs.insert(
+                name.clone(),
+                Box::new(SimpleCommandSpec::new(Decision::Allow)),
+            );
         }
 
         // Ask commands
         for name in &config.commands.ask {
-            specs.insert(name.clone(), Box::new(SimpleCommandSpec::new(Decision::Ask)));
+            specs.insert(
+                name.clone(),
+                Box::new(SimpleCommandSpec::new(Decision::Ask)),
+            );
         }
 
         // Complex command specs (override any simple entry for the same name)
         specs.insert("git".into(), Box::new(GitSpec::from_config(&config.git)));
-        specs.insert("cargo".into(), Box::new(CargoSpec::from_config(&config.cargo)));
-        specs.insert("kubectl".into(), Box::new(KubectlSpec::from_config(&config.kubectl)));
+        specs.insert(
+            "cargo".into(),
+            Box::new(CargoSpec::from_config(&config.cargo)),
+        );
+        specs.insert(
+            "kubectl".into(),
+            Box::new(KubectlSpec::from_config(&config.kubectl)),
+        );
         specs.insert("gh".into(), Box::new(GhSpec::from_config(&config.gh)));
 
         // Wrapper commands: these execute their arguments as subcommands.
@@ -124,7 +151,8 @@ impl CommandRegistry {
                 .map(|s| s.as_str())
                 .collect();
             // Skip leading numeric-only words (flag values like "10", "30")
-            let cmd_start = non_flags.iter()
+            let cmd_start = non_flags
+                .iter()
                 .position(|w| !w.chars().all(|c| c.is_ascii_digit() || c == '.'))
                 .unwrap_or(non_flags.len());
             non_flags[cmd_start..].join(" ")
@@ -156,22 +184,25 @@ impl CommandRegistry {
         // Extract the wrapped command, evaluate it, return max(floor, inner).
         if let Some(floor) = self.wrapper_floor(&ctx.base_command) {
             let wrapped_cmd = Self::extract_wrapped_command(&ctx);
-            let mut worst = floor;
+            let mut strictest = floor;
             let mut reason = if !wrapped_cmd.is_empty() {
                 let inner = self.evaluate_single(&wrapped_cmd);
-                if inner.decision > worst {
-                    worst = inner.decision;
+                if inner.decision > strictest {
+                    strictest = inner.decision;
                 }
                 format!("{} wraps: {}", ctx.base_command, inner.reason)
             } else {
                 format!("{} (no wrapped command)", ctx.base_command)
             };
             // Redirection on the wrapper itself escalates Allow → Ask
-            if worst == Decision::Allow && ctx.redirection.is_some() {
-                worst = Decision::Ask;
+            if strictest == Decision::Allow && ctx.redirection.is_some() {
+                strictest = Decision::Ask;
                 reason = format!("{} with output redirection", reason);
             }
-            return self.maybe_escalate(RuleMatch { decision: worst, reason });
+            return self.maybe_escalate(RuleMatch {
+                decision: strictest,
+                reason,
+            });
         }
 
         // Look up by exact base command name
@@ -198,12 +229,22 @@ impl CommandRegistry {
     pub fn evaluate(&self, command: &str) -> RuleMatch {
         let (pipeline, substitutions) = parse::parse_with_substitutions(command);
 
-        // Simple case: no substitutions and not compound → evaluate directly
+        // Simple case: no substitutions, not compound, and the segment text matches
+        // the original command → evaluate directly.  When the parser extracts a
+        // sub-range (e.g. a loop body), the segment text differs from the original
+        // and we must fall through to compound evaluation so the inner command is
+        // evaluated against actual rules instead of the enclosing keyword.
         if pipeline.segments.len() <= 1 && substitutions.is_empty() {
-            return self.evaluate_single(command);
+            let is_passthrough = match pipeline.segments.first() {
+                Some(seg) => seg.command.trim() == command.trim(),
+                None => true,
+            };
+            if is_passthrough {
+                return self.evaluate_single(command);
+            }
         }
 
-        let mut worst = Decision::Allow;
+        let mut strictest = Decision::Allow;
         let mut reasons = Vec::new();
 
         // Recursively evaluate substitution contents
@@ -215,33 +256,40 @@ impl CommandRegistry {
                 result.decision.label(),
                 result.reason
             ));
-            if result.decision > worst {
-                worst = result.decision;
+            if result.decision > strictest {
+                strictest = result.decision;
             }
         }
 
         // Evaluate each part of the (possibly compound) outer command
         for segment in &pipeline.segments {
-            let result = self.evaluate_single(&segment.command);
+            let mut result = self.evaluate_single(&segment.command);
+            // Propagate redirection from wrapping constructs (e.g. a for loop
+            // with output redirection: `for ... done > file`).  The inner
+            // command text won't contain the redirect, so evaluate_single
+            // can't see it — escalate here.
+            if result.decision == Decision::Allow
+                && let Some(ref r) = segment.redirection
+            {
+                result.decision = Decision::Ask;
+                result.reason =
+                    format!("{} (escalated: wrapping {})", result.reason, r.description);
+            }
             let label: String = segment.command.trim().chars().take(60).collect();
             reasons.push(format!(
                 "  [{label}] -> {}: {}",
                 result.decision.label(),
                 result.reason
             ));
-            if result.decision > worst {
-                worst = result.decision;
+            if result.decision > strictest {
+                strictest = result.decision;
             }
         }
 
         // Build summary header
         let mut desc = Vec::new();
         if !pipeline.operators.is_empty() {
-            let mut unique_ops: Vec<&str> = pipeline
-                .operators
-                .iter()
-                .map(|o| o.as_str())
-                .collect();
+            let mut unique_ops: Vec<&str> = pipeline.operators.iter().map(|o| o.as_str()).collect();
             unique_ops.sort();
             unique_ops.dedup();
             desc.push(unique_ops.join(", "));
@@ -256,7 +304,7 @@ impl CommandRegistry {
         };
 
         RuleMatch {
-            decision: worst,
+            decision: strictest,
             reason: format!("{}:\n{}", header, reasons.join("\n")),
         }
     }

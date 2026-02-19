@@ -1,9 +1,16 @@
-pub mod cargo;
-pub mod deny;
-pub mod gh;
-pub mod git;
-pub mod kubectl;
+//! Command evaluation specs: per-tool logic for deciding allow/ask/deny.
+//!
+//! This module contains the `CommandSpec` trait and two categories of implementation:
+//!
+//! - **`simple`** — A data-driven spec for flat command lists (allow/ask/deny with no
+//!   subcommand awareness).
+//! - **`tools`** — Subcommand-aware evaluators for specific CLI tools (git, cargo, kubectl, gh),
+//!   each with config-driven classification, env-gated auto-allow, and redirection escalation.
+
+/// Data-driven spec for flat allow/ask/deny command lists.
 pub mod simple;
+/// Subcommand-aware evaluators for specific CLI tools.
+pub mod tools;
 
 use crate::eval::{CommandContext, RuleMatch};
 

@@ -118,10 +118,7 @@ mod tests {
 
     #[test]
     fn base_command_env_with_path() {
-        assert_eq!(
-            base_command("FOO=bar /usr/local/bin/git status"),
-            "git"
-        );
+        assert_eq!(base_command("FOO=bar /usr/local/bin/git status"), "git");
     }
 
     #[test]
@@ -157,10 +154,7 @@ mod tests {
 
     #[test]
     fn tokenize_quoted() {
-        assert_eq!(
-            tokenize("echo 'hello world'"),
-            vec!["echo", "hello world"]
-        );
+        assert_eq!(tokenize("echo 'hello world'"), vec!["echo", "hello world"]);
     }
 
     #[test]

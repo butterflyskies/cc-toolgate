@@ -1,15 +1,34 @@
-use crate::commands::CommandSpec;
+//! Subcommand-aware git evaluation.
+//!
+//! Handles global flags (`-C`, `--no-pager`, etc.) to correctly extract the
+//! subcommand, distinguishes read-only from mutating operations, supports
+//! env-gated auto-allow for configured subcommands, and detects force-push flags.
+
+use super::super::CommandSpec;
 use crate::config::GitConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
 
+/// Subcommand-aware git evaluator.
+///
+/// Evaluation order:
+/// 1. Force-push flags → always ASK
+/// 2. Read-only subcommands → ALLOW (with redirection escalation)
+/// 3. Env-gated subcommands → ALLOW if env var present, else ASK
+/// 4. `--version` → ALLOW
+/// 5. Everything else → ASK
 pub struct GitSpec {
+    /// Git subcommands that are always allowed (e.g. `status`, `log`, `diff`).
     read_only: Vec<String>,
+    /// Subcommands allowed only when `config_env_var` is present.
     allowed_with_config: Vec<String>,
+    /// Env var name that gates `allowed_with_config` subcommands.
     config_env_var: String,
+    /// Flags indicating force-push (always ASK regardless of env-gating).
     force_push_flags: Vec<String>,
 }
 
 impl GitSpec {
+    /// Build a git spec from configuration.
     pub fn from_config(config: &GitConfig) -> Self {
         Self {
             read_only: config.read_only.clone(),
@@ -25,9 +44,14 @@ impl GitSpec {
 
     /// Global git flags that are standalone (no argument consumed).
     const GLOBAL_SOLO_FLAGS: &[&str] = &[
-        "--bare", "--no-pager", "--no-replace-objects",
-        "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs",
-        "--icase-pathspecs", "--no-optional-locks",
+        "--bare",
+        "--no-pager",
+        "--no-replace-objects",
+        "--literal-pathspecs",
+        "--glob-pathspecs",
+        "--noglob-pathspecs",
+        "--icase-pathspecs",
+        "--no-optional-locks",
     ];
 
     /// Extract the git subcommand word (e.g. "push" from "git push origin main").
@@ -141,7 +165,12 @@ mod tests {
     /// Build a spec with env-gated config enabled (like a user's custom config).
     fn spec_with_env_gate() -> GitSpec {
         GitSpec::from_config(&GitConfig {
-            read_only: vec!["status".into(), "log".into(), "diff".into(), "branch".into()],
+            read_only: vec![
+                "status".into(),
+                "log".into(),
+                "diff".into(),
+                "branch".into(),
+            ],
             allowed_with_config: vec!["push".into(), "pull".into(), "add".into()],
             config_env_var: "GIT_CONFIG_GLOBAL".into(),
             force_push_flags: vec!["--force".into(), "-f".into(), "--force-with-lease".into()],

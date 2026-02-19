@@ -18,22 +18,105 @@ Every command gets one of three decisions:
 
 Redirection on allowed commands (e.g. `echo foo > file.txt`) automatically escalates to ASK.
 
+## Architecture
+
+cc-toolgate uses a tree-sitter-bash parser to build a full AST of the command, then walks it to extract segments, operators, substitutions, and redirections for evaluation.
+
+```mermaid
+graph LR
+    stdin["stdin (JSON)"] --> main
+    main --> lib["lib.rs<br/>evaluate()"]
+    lib --> registry["eval/<br/>CommandRegistry"]
+    registry --> shell["parse/shell.rs<br/>tree-sitter AST"]
+    registry --> tokenize["parse/tokenize.rs<br/>shlex splitting"]
+    registry --> commands["commands/*<br/>CommandSpec"]
+    registry --> result["Decision<br/>+ reason"]
+    result --> stdout["stdout (JSON)"]
+```
+
+### Module layout
+
+```
+src/
+  main.rs           Entry point, CLI flags (84 lines)
+  lib.rs            Re-exports, top-level evaluate() orchestrator
+  config.rs         TOML config loading, ConfigOverlay merge system
+  parse/
+    mod.rs          Re-exports
+    shell.rs        tree-sitter-bash AST walker: compound splitting,
+                    substitution extraction, redirection detection
+    tokenize.rs     shlex-based word splitting, base_command(), env_vars()
+    types.rs        ParsedPipeline, ShellSegment, Operator, Redirection
+  eval/
+    mod.rs          CommandRegistry, strictest-wins aggregation
+    context.rs      CommandContext struct
+    decision.rs     Decision enum, RuleMatch
+  commands/         CommandSpec implementations per tool category
+    simple.rs       Flat allow/ask/deny lists
+    deny.rs         Always-deny commands (shred, dd, mkfs, etc.)
+    git.rs          Subcommand-aware git evaluation
+    cargo.rs        Subcommand-aware cargo evaluation
+    kubectl.rs      Subcommand-aware kubectl evaluation
+    gh.rs           Subcommand-aware gh CLI evaluation
+  logging.rs        File appender for decision log
+tests/
+  integration.rs    219 integration tests (decision_test! macro)
+config.default.toml Embedded default config
+```
+
 ## How it works
 
-1. Claude Code calls the `Bash` tool with a command string
-2. The PreToolUse hook pipes the tool input (JSON) to cc-toolgate on stdin
-3. cc-toolgate parses the command: splits compound expressions (`&&`, `||`, `|`, `;`), extracts command substitutions (`$(...)`, backticks), detects heredocs, and identifies redirections
-4. Each segment is evaluated against the command registry (built from config)
-5. The worst decision across all segments wins
-6. cc-toolgate outputs the decision as JSON on stdout
-7. Claude Code acts on the decision: proceed, prompt, or block
+```mermaid
+flowchart TD
+    A["Claude Code calls Bash tool"] --> B["PreToolUse hook pipes JSON to cc-toolgate"]
+    B --> C["Parse command with tree-sitter-bash"]
+    C --> D["Walk AST"]
+    D --> E["Extract segments + operators"]
+    E --> F{"For each segment"}
+    F --> G["Resolve wrapper commands<br/>(sudo, xargs, env, ...)"]
+    G --> H["Evaluate against CommandRegistry"]
+    H --> I["Check redirections"]
+    I --> J["Check command substitutions<br/>recursively"]
+    J --> F
+    F --> K["Strictest decision wins"]
+    K --> L["Output JSON to stdout"]
+    L --> M{"Decision?"}
+    M -->|ALLOW| N["Runs silently"]
+    M -->|ASK| O["Claude Code prompts you"]
+    M -->|DENY| P["Blocked outright"]
+```
+
+### Command parsing
+
+cc-toolgate uses [tree-sitter-bash](https://github.com/tree-sitter/tree-sitter-bash) to parse commands into a full AST before evaluation. This replaced an earlier hand-rolled parser and fixes a class of bugs around heredocs, nested quoting, and operator extraction.
+
+The AST walker handles these node types:
+
+```mermaid
+graph TD
+    program --> list & pipeline & command & redirected_statement
+    list --> |"&&, ||, ;"| pipeline
+    pipeline --> |pipe| command
+    command --> simple_command & subshell & compound
+    compound --> for_statement & while_statement & if_statement & case_statement
+    redirected_statement --> command & heredoc_redirect
+    heredoc_redirect --> |"pipe/&&/||/;"| next_command
+```
+
+Key behaviors:
+- **Heredoc pipes**: `cat <<'EOF' | kubectl apply -f -` correctly identifies both the `cat` and `kubectl apply` segments
+- **Command substitutions**: `$(...)` and backticks are recursively evaluated; single-quoted strings are not expanded
+- **Process substitutions**: `<(...)` and `>(...)` are recognized without false redirection detection
+- **/dev/null**: Redirections to `/dev/null` don't escalate (they're non-mutating)
+- **fd duplication**: `2>&1`, `>&2` are safe; `>&3` escalates (could write to a file)
 
 ### Wrapper commands
 
 Commands that execute their arguments (like `sudo`, `xargs`, `env`) are evaluated recursively. The wrapped command is extracted and evaluated, and the final decision is the stricter of the wrapper's floor and the inner command's decision.
 
 ```
-sudo rm -rf /        → max(ask_floor, deny) = DENY
+sudo rm -rf /        → max(ask_floor, ask) = ASK
+sudo shred /dev/sda  → max(ask_floor, deny) = DENY
 xargs grep foo       → max(allow_floor, allow) = ALLOW
 env FOO=bar rm file  → max(allow_floor, ask) = ASK
 ```
@@ -55,7 +138,7 @@ Build from source (requires Rust 2024 edition, i.e. rustc 1.85+):
 cargo build --release
 ```
 
-The binary is at `target/release/cc-toolgate` (~1.1MB with LTO + strip).
+The binary is at `target/release/cc-toolgate`.
 
 ### Hook configuration
 
@@ -145,6 +228,56 @@ Commands in the `[wrappers]` section execute their arguments as subcommands. Eac
 
 - **`allow_floor`**: `xargs`, `parallel`, `env`, `nohup`, `nice`, `timeout`, `time`, `watch`, `strace`, `ltrace`
 - **`ask_floor`**: `sudo`, `su`, `doas`, `pkexec`
+
+## Testing
+
+### Running tests
+
+```bash
+cargo test              # Run all 337 tests (118 unit + 219 integration)
+cargo test --lib        # Unit tests only
+cargo test --test integration  # Integration tests only
+```
+
+[cargo-nextest](https://nexte.st/) is recommended for faster parallel execution and better output:
+
+```bash
+cargo nextest run       # All tests
+cargo nextest run -E 'test(heredoc)'  # Filter by name pattern
+```
+
+### Test structure
+
+- **Unit tests** (118): Colocated in `src/` modules with `#[cfg(test)]`. These test internal parsing and evaluation logic and need `super::*` access to private helpers.
+- **Integration tests** (219): In `tests/integration.rs`. These test end-to-end command evaluation through the public API.
+
+### Adding tests
+
+Most integration tests use the `decision_test!` macro for one-line declarations:
+
+```rust
+decision_test!(test_name, "command string", ExpectedDecision);
+// e.g.
+decision_test!(allow_git_log, "git log --oneline", Allow);
+decision_test!(ask_rm, "rm -rf /tmp", Ask);
+decision_test!(deny_shred, "shred /dev/sda", Deny);
+```
+
+For tests that need reason assertions, custom registries, or multi-line heredoc commands, write a full `#[test] fn` block.
+
+## Contributing
+
+### Project structure at a glance
+
+1. **Adding a new command rule**: Edit `config.default.toml` to add it to the appropriate list, or add a new `CommandSpec` under `src/commands/`.
+2. **Adding a new complex command**: Create a new file in `src/commands/`, implement `CommandSpec`, and register it in `src/eval/mod.rs`.
+3. **Parser changes**: Modify `src/parse/shell.rs` (tree-sitter AST walker) or `src/parse/tokenize.rs` (shlex tokenizer).
+4. **Adding a test**: Add a `decision_test!()` line to `tests/integration.rs` under the appropriate section.
+
+### Build requirements
+
+- Rust 2024 edition (rustc 1.85+)
+- A C compiler (for tree-sitter-bash; cc crate handles this automatically)
 
 ## Logging
 

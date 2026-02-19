@@ -1,8 +1,14 @@
+//! Decision logging to `~/.local/share/cc-toolgate/decisions.log`.
+//!
+//! Initializes a file logger on first call and writes one line per evaluated
+//! command with the decision, truncated command text, and reason.
+
 use crate::eval::RuleMatch;
 use log::info;
 use simplelog::{Config, LevelFilter, WriteLogger};
 use std::sync::Once;
 
+/// Ensures the logger is initialized exactly once per process.
 static INIT: Once = Once::new();
 
 /// Initialize the file logger. Best-effort: failures are silently ignored.
