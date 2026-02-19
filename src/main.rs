@@ -16,6 +16,13 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let escalate_deny = args.iter().any(|a| a == "--escalate-deny");
 
+    // --dump-ast <command>: print tree-sitter AST and parsed pipeline, then exit
+    if let Some(pos) = args.iter().position(|a| a == "--dump-ast") {
+        let cmd = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("");
+        print!("{}", cc_toolgate::parse::dump_ast(cmd));
+        return;
+    }
+
     // --dump-config [json]: print effective config and exit
     if let Some(pos) = args.iter().position(|a| a == "--dump-config") {
         let config = cc_toolgate::config::Config::load();

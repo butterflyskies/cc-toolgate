@@ -14,6 +14,6 @@ pub mod tokenize;
 /// Shared types: [`ParsedPipeline`], [`ShellSegment`], [`Operator`], [`Redirection`].
 pub mod types;
 
-pub use shell::{has_output_redirection, parse_with_substitutions};
+pub use shell::{dump_ast, has_output_redirection, parse_with_substitutions};
 pub use tokenize::{base_command, env_vars, tokenize};
 pub use types::{Operator, ParsedPipeline, Redirection, ShellSegment};

@@ -866,6 +866,58 @@ pub fn has_output_redirection(command: &str) -> Option<Redirection> {
     detect_redirections(tree.root_node(), command.as_bytes())
 }
 
+/// Dump the tree-sitter AST and parsed pipeline for a command string.
+///
+/// Returns a human-readable diagnostic string showing the raw AST tree,
+/// the segments and operators produced by the walker, and any extracted
+/// substitutions. Used by `--dump-ast` CLI flag.
+pub fn dump_ast(command: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    // Raw AST
+    let tree = parse_tree(command);
+    writeln!(out, "── tree-sitter AST ──").unwrap();
+    fn print_node(out: &mut String, node: tree_sitter::Node, source: &[u8], indent: usize) {
+        let text = node.utf8_text(source).unwrap_or("???");
+        let short: String = text.chars().take(60).collect();
+        let tag = if node.is_named() { "named" } else { "anon" };
+        writeln!(out, "{}{} [{}] {:?}", "  ".repeat(indent), node.kind(), tag, short).unwrap();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            print_node(out, child, source, indent + 1);
+        }
+    }
+    print_node(&mut out, tree.root_node(), command.as_bytes(), 0);
+
+    // Parsed pipeline
+    let (pipeline, substitutions) = parse_with_substitutions(command);
+    writeln!(out, "\n── parsed pipeline ──").unwrap();
+    for (i, seg) in pipeline.segments.iter().enumerate() {
+        let redir = seg.redirection.as_ref().map(|r| format!(" [{}]", r.description)).unwrap_or_default();
+        writeln!(out, "  segment {}: {:?}{}", i, seg.command, redir).unwrap();
+        if i < pipeline.operators.len() {
+            writeln!(out, "  operator: {}", pipeline.operators[i].as_str()).unwrap();
+        }
+    }
+    if !substitutions.is_empty() {
+        writeln!(out, "\n── substitutions ──").unwrap();
+        for (i, sub) in substitutions.iter().enumerate() {
+            writeln!(out, "  {}: {:?}", i, sub).unwrap();
+        }
+    }
+
+    // Redirection check
+    let redir = has_output_redirection(command);
+    writeln!(out, "\n── output redirection ──").unwrap();
+    match redir {
+        Some(r) => writeln!(out, "  {}", r.description).unwrap(),
+        None => writeln!(out, "  (none)").unwrap(),
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
