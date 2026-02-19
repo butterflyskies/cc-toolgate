@@ -28,4 +28,3 @@ pub struct RuleMatch {
     pub decision: Decision,
     pub reason: String,
 }
-

@@ -155,7 +155,10 @@ mod tests {
 
     #[test]
     fn env_gate_apply_no_config() {
-        assert_eq!(eval_with_env_gate("kubectl apply -f deploy.yaml"), Decision::Ask);
+        assert_eq!(
+            eval_with_env_gate("kubectl apply -f deploy.yaml"),
+            Decision::Ask
+        );
     }
 
     #[test]

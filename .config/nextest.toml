@@ -1,0 +1,5 @@
+[profile.default]
+# Warn if any single test takes longer than 2 seconds
+slow-timeout = { period = "2s" }
+
+fail-fast = false

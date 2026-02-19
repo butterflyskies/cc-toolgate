@@ -8,21 +8,25 @@
 ## Architecture
 ```
 src/
-  main.rs          Entry point + CLI flags + 219 integration tests
-  lib.rs           Re-exports, top-level evaluate() orchestrator
-  config.rs        TOML config loading, ConfigOverlay merge system
+  main.rs           Entry point + CLI flags (84 lines)
+  lib.rs            Re-exports, top-level evaluate() orchestrator
+  config.rs         TOML config loading, ConfigOverlay merge system
   parse/
-    mod.rs         Re-exports
-    shell.rs       tree-sitter-bash AST: compound splitting, substitution extraction, redirection detection
-    tokenize.rs    shlex-based word splitting, base_command(), env_vars()
-    types.rs       ParsedPipeline, ShellSegment, Operator, Redirection
+    mod.rs          Re-exports
+    shell.rs        tree-sitter-bash AST: compound splitting, substitution extraction, redirection detection
+    tokenize.rs     shlex-based word splitting, base_command(), env_vars()
+    types.rs        ParsedPipeline, ShellSegment, Operator, Redirection
   eval/
-    mod.rs         CommandRegistry, worst-wins aggregation
-    context.rs     CommandContext struct
-    decision.rs    Decision enum, RuleMatch
-  commands/        CommandSpec implementations (simple, deny, git, cargo, kubectl, gh)
-  logging.rs       File appender
-config.default.toml  Embedded default config
+    mod.rs          CommandRegistry, strictest-wins aggregation
+    context.rs      CommandContext struct
+    decision.rs     Decision enum, RuleMatch
+  commands/         CommandSpec implementations (simple, deny, git, cargo, kubectl, gh)
+  logging.rs        File appender
+tests/
+  integration.rs    219 integration tests (decision_test! macro + complex tests)
+config.default.toml Embedded default config
+.config/
+  nextest.toml      cargo-nextest configuration
 ```
 
 ## Key Types (src/parse/types.rs)
@@ -35,4 +39,4 @@ config.default.toml  Embedded default config
 serde, serde_json, toml, shlex, log, simplelog, tree-sitter, tree-sitter-bash
 
 ## Tests
-336 total: 117 lib (colocated) + 219 integration (in main.rs)
+337 total: 118 lib (colocated) + 219 integration (in tests/integration.rs)

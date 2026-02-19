@@ -329,16 +329,15 @@ fn walk_ast(node: Node, source: &[u8]) -> WalkResult {
         }
         "if_statement" => walk_if(node, source),
         "case_statement" => walk_case(node, source),
-        "subshell" | "compound_statement" | "do_group" | "else_clause" | "elif_clause"
-        => walk_block(node, source),
+        "subshell" | "compound_statement" | "do_group" | "else_clause" | "elif_clause" => {
+            walk_block(node, source)
+        }
         "case_item" => walk_case_item(node, source),
         "negated_command" => walk_negated(node, source),
         "function_definition" => walk_function(node, source),
         "variable_assignment" => WalkResult::single(node.start_byte(), node.end_byte(), None),
         "comment" | "heredoc_body" => WalkResult::empty(),
-        _ if node.is_named() => {
-            WalkResult::single(node.start_byte(), node.end_byte(), None)
-        }
+        _ if node.is_named() => WalkResult::single(node.start_byte(), node.end_byte(), None),
         _ => WalkResult::empty(),
     }
 }
@@ -626,8 +625,13 @@ fn walk_if(node: Node, source: &[u8]) -> WalkResult {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
-            "command" | "declaration_command" | "pipeline" | "list"
-            | "redirected_statement" | "compound_statement" | "subshell"
+            "command"
+            | "declaration_command"
+            | "pipeline"
+            | "list"
+            | "redirected_statement"
+            | "compound_statement"
+            | "subshell"
             | "negated_command" => {
                 result.append(walk_ast(child, source), Some(Operator::Semi));
             }
@@ -809,8 +813,7 @@ pub fn parse_with_substitutions(command: &str) -> (ParsedPipeline, Vec<String>) 
         .segments
         .iter()
         .map(|seg| {
-            let text =
-                text_replacing_substitutions(command, seg.start, seg.end, &subst_spans);
+            let text = text_replacing_substitutions(command, seg.start, seg.end, &subst_spans);
             ShellSegment {
                 command: text.trim().to_string(),
                 redirection: seg.redirection.clone(),
@@ -1039,9 +1042,8 @@ mod tests {
 
     #[test]
     fn case_pattern_not_treated_as_command() {
-        let (p, _) = parse_with_substitutions(
-            r#"case $x in rm) echo hi ;; kubectl) echo bye ;; esac"#,
-        );
+        let (p, _) =
+            parse_with_substitutions(r#"case $x in rm) echo hi ;; kubectl) echo bye ;; esac"#);
         let commands: Vec<&str> = p.segments.iter().map(|s| s.command.as_str()).collect();
         // Pattern labels (rm, kubectl) must NOT appear as segments.
         // Only the body commands (echo hi, echo bye) should.

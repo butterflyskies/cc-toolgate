@@ -273,8 +273,7 @@ impl Config {
     /// Try to load user overlay from ~/.config/cc-toolgate/config.toml.
     fn load_overlay() -> Option<ConfigOverlay> {
         let home = std::env::var_os("HOME")?;
-        let path = std::path::Path::new(&home)
-            .join(".config/cc-toolgate/config.toml");
+        let path = std::path::Path::new(&home).join(".config/cc-toolgate/config.toml");
         let content = std::fs::read_to_string(path).ok()?;
         match toml::from_str(&content) {
             Ok(overlay) => Some(overlay),
@@ -294,46 +293,116 @@ impl Config {
 
         // Commands
         let c = overlay.commands;
-        merge_list(&mut self.commands.allow, c.allow, &c.remove_allow, c.replace);
+        merge_list(
+            &mut self.commands.allow,
+            c.allow,
+            &c.remove_allow,
+            c.replace,
+        );
         merge_list(&mut self.commands.ask, c.ask, &c.remove_ask, c.replace);
         merge_list(&mut self.commands.deny, c.deny, &c.remove_deny, c.replace);
 
         // Wrappers
         let w = overlay.wrappers;
-        merge_list(&mut self.wrappers.allow_floor, w.allow_floor, &w.remove_allow_floor, w.replace);
-        merge_list(&mut self.wrappers.ask_floor, w.ask_floor, &w.remove_ask_floor, w.replace);
+        merge_list(
+            &mut self.wrappers.allow_floor,
+            w.allow_floor,
+            &w.remove_allow_floor,
+            w.replace,
+        );
+        merge_list(
+            &mut self.wrappers.ask_floor,
+            w.ask_floor,
+            &w.remove_ask_floor,
+            w.replace,
+        );
 
         // Git
         let g = overlay.git;
-        merge_list(&mut self.git.read_only, g.read_only, &g.remove_read_only, g.replace);
-        merge_list(&mut self.git.allowed_with_config, g.allowed_with_config, &g.remove_allowed_with_config, g.replace);
-        merge_list(&mut self.git.force_push_flags, g.force_push_flags, &g.remove_force_push_flags, g.replace);
+        merge_list(
+            &mut self.git.read_only,
+            g.read_only,
+            &g.remove_read_only,
+            g.replace,
+        );
+        merge_list(
+            &mut self.git.allowed_with_config,
+            g.allowed_with_config,
+            &g.remove_allowed_with_config,
+            g.replace,
+        );
+        merge_list(
+            &mut self.git.force_push_flags,
+            g.force_push_flags,
+            &g.remove_force_push_flags,
+            g.replace,
+        );
         if let Some(v) = g.config_env_var {
             self.git.config_env_var = v;
         }
 
         // Cargo
         let ca = overlay.cargo;
-        merge_list(&mut self.cargo.safe_subcommands, ca.safe_subcommands, &ca.remove_safe_subcommands, ca.replace);
-        merge_list(&mut self.cargo.allowed_with_config, ca.allowed_with_config, &ca.remove_allowed_with_config, ca.replace);
+        merge_list(
+            &mut self.cargo.safe_subcommands,
+            ca.safe_subcommands,
+            &ca.remove_safe_subcommands,
+            ca.replace,
+        );
+        merge_list(
+            &mut self.cargo.allowed_with_config,
+            ca.allowed_with_config,
+            &ca.remove_allowed_with_config,
+            ca.replace,
+        );
         if let Some(v) = ca.config_env_var {
             self.cargo.config_env_var = v;
         }
 
         // Kubectl
         let k = overlay.kubectl;
-        merge_list(&mut self.kubectl.read_only, k.read_only, &k.remove_read_only, k.replace);
-        merge_list(&mut self.kubectl.mutating, k.mutating, &k.remove_mutating, k.replace);
-        merge_list(&mut self.kubectl.allowed_with_config, k.allowed_with_config, &k.remove_allowed_with_config, k.replace);
+        merge_list(
+            &mut self.kubectl.read_only,
+            k.read_only,
+            &k.remove_read_only,
+            k.replace,
+        );
+        merge_list(
+            &mut self.kubectl.mutating,
+            k.mutating,
+            &k.remove_mutating,
+            k.replace,
+        );
+        merge_list(
+            &mut self.kubectl.allowed_with_config,
+            k.allowed_with_config,
+            &k.remove_allowed_with_config,
+            k.replace,
+        );
         if let Some(v) = k.config_env_var {
             self.kubectl.config_env_var = v;
         }
 
         // Gh
         let gh = overlay.gh;
-        merge_list(&mut self.gh.read_only, gh.read_only, &gh.remove_read_only, gh.replace);
-        merge_list(&mut self.gh.mutating, gh.mutating, &gh.remove_mutating, gh.replace);
-        merge_list(&mut self.gh.allowed_with_config, gh.allowed_with_config, &gh.remove_allowed_with_config, gh.replace);
+        merge_list(
+            &mut self.gh.read_only,
+            gh.read_only,
+            &gh.remove_read_only,
+            gh.replace,
+        );
+        merge_list(
+            &mut self.gh.mutating,
+            gh.mutating,
+            &gh.remove_mutating,
+            gh.replace,
+        );
+        merge_list(
+            &mut self.gh.allowed_with_config,
+            gh.allowed_with_config,
+            &gh.remove_allowed_with_config,
+            gh.replace,
+        );
         if let Some(v) = gh.config_env_var {
             self.gh.config_env_var = v;
         }
@@ -389,10 +458,12 @@ mod tests {
     #[test]
     fn overlay_extends_allow_list() {
         let mut config = Config::default_config();
-        config.apply_overlay_str(r#"
+        config.apply_overlay_str(
+            r#"
             [commands]
             allow = ["my-tool"]
-        "#);
+        "#,
+        );
         // Default allow list still present
         assert!(config.commands.allow.contains(&"ls".to_string()));
         // New item added
@@ -402,10 +473,12 @@ mod tests {
     #[test]
     fn overlay_removes_from_allow_list() {
         let mut config = Config::default_config();
-        config.apply_overlay_str(r#"
+        config.apply_overlay_str(
+            r#"
             [commands]
             remove_allow = ["cat", "find"]
-        "#);
+        "#,
+        );
         assert!(!config.commands.allow.contains(&"cat".to_string()));
         assert!(!config.commands.allow.contains(&"find".to_string()));
         // Other items still present
@@ -428,10 +501,12 @@ mod tests {
     #[test]
     fn overlay_removes_from_wrappers() {
         let mut config = Config::default_config();
-        config.apply_overlay_str(r#"
+        config.apply_overlay_str(
+            r#"
             [wrappers]
             remove_allow_floor = ["xargs"]
-        "#);
+        "#,
+        );
         assert!(!config.wrappers.allow_floor.contains(&"xargs".to_string()));
         // Others untouched
         assert!(config.wrappers.allow_floor.contains(&"env".to_string()));
@@ -440,24 +515,33 @@ mod tests {
     #[test]
     fn overlay_extends_wrappers() {
         let mut config = Config::default_config();
-        config.apply_overlay_str(r#"
+        config.apply_overlay_str(
+            r#"
             [wrappers]
             allow_floor = ["my-wrapper"]
-        "#);
-        assert!(config.wrappers.allow_floor.contains(&"my-wrapper".to_string()));
+        "#,
+        );
+        assert!(
+            config
+                .wrappers
+                .allow_floor
+                .contains(&"my-wrapper".to_string())
+        );
         assert!(config.wrappers.allow_floor.contains(&"xargs".to_string()));
     }
 
     #[test]
     fn overlay_replace_commands() {
         let mut config = Config::default_config();
-        config.apply_overlay_str(r#"
+        config.apply_overlay_str(
+            r#"
             [commands]
             replace = true
             allow = ["ls", "cat"]
             ask = ["rm"]
             deny = ["shred"]
-        "#);
+        "#,
+        );
         assert_eq!(config.commands.allow, vec!["ls", "cat"]);
         assert_eq!(config.commands.ask, vec!["rm"]);
         assert_eq!(config.commands.deny, vec!["shred"]);
@@ -466,13 +550,18 @@ mod tests {
     #[test]
     fn overlay_git_env_gate() {
         let mut config = Config::default_config();
-        config.apply_overlay_str(r#"
+        config.apply_overlay_str(
+            r#"
             [git]
             allowed_with_config = ["commit", "add", "push"]
             config_env_var = "GIT_CONFIG_GLOBAL"
-        "#);
+        "#,
+        );
         assert_eq!(config.git.config_env_var, "GIT_CONFIG_GLOBAL");
-        assert_eq!(config.git.allowed_with_config, vec!["commit", "add", "push"]);
+        assert_eq!(
+            config.git.allowed_with_config,
+            vec!["commit", "add", "push"]
+        );
         // Default read_only still present
         assert!(config.git.read_only.contains(&"status".to_string()));
         assert!(config.git.read_only.contains(&"log".to_string()));
@@ -481,20 +570,24 @@ mod tests {
     #[test]
     fn overlay_escalate_deny() {
         let mut config = Config::default_config();
-        config.apply_overlay_str(r#"
+        config.apply_overlay_str(
+            r#"
             [settings]
             escalate_deny = true
-        "#);
+        "#,
+        );
         assert!(config.settings.escalate_deny);
     }
 
     #[test]
     fn overlay_omitted_settings_unchanged() {
         let mut config = Config::default_config();
-        config.apply_overlay_str(r#"
+        config.apply_overlay_str(
+            r#"
             [commands]
             allow = ["my-tool"]
-        "#);
+        "#,
+        );
         // Settings not in overlay remain at defaults
         assert!(!config.settings.escalate_deny);
     }
@@ -502,10 +595,12 @@ mod tests {
     #[test]
     fn overlay_no_duplicates() {
         let mut config = Config::default_config();
-        config.apply_overlay_str(r#"
+        config.apply_overlay_str(
+            r#"
             [commands]
             allow = ["ls"]
-        "#);
+        "#,
+        );
         let count = config.commands.allow.iter().filter(|s| *s == "ls").count();
         assert_eq!(count, 1);
     }
@@ -514,11 +609,13 @@ mod tests {
     fn overlay_remove_and_add() {
         let mut config = Config::default_config();
         // Move "eval" from deny to ask
-        config.apply_overlay_str(r#"
+        config.apply_overlay_str(
+            r#"
             [commands]
             remove_deny = ["eval"]
             ask = ["eval"]
-        "#);
+        "#,
+        );
         assert!(!config.commands.deny.contains(&"eval".to_string()));
         assert!(config.commands.ask.contains(&"eval".to_string()));
     }
@@ -526,12 +623,14 @@ mod tests {
     #[test]
     fn overlay_replace_git() {
         let mut config = Config::default_config();
-        config.apply_overlay_str(r#"
+        config.apply_overlay_str(
+            r#"
             [git]
             replace = true
             read_only = ["status", "log"]
             force_push_flags = ["--force"]
-        "#);
+        "#,
+        );
         assert_eq!(config.git.read_only, vec!["status", "log"]);
         assert_eq!(config.git.force_push_flags, vec!["--force"]);
         assert!(config.git.allowed_with_config.is_empty());
@@ -541,11 +640,13 @@ mod tests {
     fn overlay_unrelated_sections_untouched() {
         let mut config = Config::default_config();
         let original_kubectl_read_only = config.kubectl.read_only.clone();
-        config.apply_overlay_str(r#"
+        config.apply_overlay_str(
+            r#"
             [git]
             allowed_with_config = ["push"]
             config_env_var = "GIT_CONFIG_GLOBAL"
-        "#);
+        "#,
+        );
         assert_eq!(config.kubectl.read_only, original_kubectl_read_only);
     }
 

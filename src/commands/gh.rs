@@ -179,7 +179,10 @@ mod tests {
 
     #[test]
     fn env_gate_pr_create_no_config() {
-        assert_eq!(eval_with_env_gate("gh pr create --title 'Fix'"), Decision::Ask);
+        assert_eq!(
+            eval_with_env_gate("gh pr create --title 'Fix'"),
+            Decision::Ask
+        );
     }
 
     #[test]

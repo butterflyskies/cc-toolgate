@@ -25,9 +25,14 @@ impl GitSpec {
 
     /// Global git flags that are standalone (no argument consumed).
     const GLOBAL_SOLO_FLAGS: &[&str] = &[
-        "--bare", "--no-pager", "--no-replace-objects",
-        "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs",
-        "--icase-pathspecs", "--no-optional-locks",
+        "--bare",
+        "--no-pager",
+        "--no-replace-objects",
+        "--literal-pathspecs",
+        "--glob-pathspecs",
+        "--noglob-pathspecs",
+        "--icase-pathspecs",
+        "--no-optional-locks",
     ];
 
     /// Extract the git subcommand word (e.g. "push" from "git push origin main").
@@ -141,7 +146,12 @@ mod tests {
     /// Build a spec with env-gated config enabled (like a user's custom config).
     fn spec_with_env_gate() -> GitSpec {
         GitSpec::from_config(&GitConfig {
-            read_only: vec!["status".into(), "log".into(), "diff".into(), "branch".into()],
+            read_only: vec![
+                "status".into(),
+                "log".into(),
+                "diff".into(),
+                "branch".into(),
+            ],
             allowed_with_config: vec!["push".into(), "pull".into(), "add".into()],
             config_env_var: "GIT_CONFIG_GLOBAL".into(),
             force_push_flags: vec!["--force".into(), "-f".into(), "--force-with-lease".into()],
