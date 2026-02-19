@@ -222,7 +222,18 @@ impl CommandRegistry {
 
         // Evaluate each part of the (possibly compound) outer command
         for segment in &pipeline.segments {
-            let result = self.evaluate_single(&segment.command);
+            let mut result = self.evaluate_single(&segment.command);
+            // Propagate redirection from wrapping constructs (e.g. a for loop
+            // with output redirection: `for ... done > file`).  The inner
+            // command text won't contain the redirect, so evaluate_single
+            // can't see it — escalate here.
+            if result.decision == Decision::Allow
+                && let Some(ref r) = segment.redirection
+            {
+                result.decision = Decision::Ask;
+                result.reason =
+                    format!("{} (escalated: wrapping {})", result.reason, r.description);
+            }
             let label: String = segment.command.trim().chars().take(60).collect();
             reasons.push(format!(
                 "  [{label}] -> {}: {}",

@@ -1,740 +1,776 @@
+//! Shell command parsing backed by tree-sitter-bash.
+//!
+//! This module provides two public functions:
+//!
+//! - [`parse_with_substitutions`] — decomposes a shell command string into a
+//!   [`ParsedPipeline`] of segments joined by operators, plus a list of
+//!   extracted command/process substitution contents.
+//!
+//! - [`has_output_redirection`] — checks whether a command string contains
+//!   output redirection that could mutate filesystem state.
+//!
+//! Both functions parse their input with tree-sitter-bash, which provides a
+//! full AST from a formal grammar.  This means quoting, heredocs, control flow
+//! keywords, and nested substitutions are handled by the grammar itself —
+//! the code here walks the resulting AST rather than scanning characters.
+//!
+//! # Control flow handling
+//!
+//! Shell keywords (`for`, `if`, `while`, `case`) are grammar structure, not
+//! commands.  The AST walker recurses into control flow bodies and extracts the
+//! actual commands inside them as pipeline segments.  For example,
+//! `for i in *; do rm "$i"; done` produces a segment for `rm "$i"`, not for
+//! `for` or `done`.
+//!
+//! # Redirection propagation
+//!
+//! When a control flow construct is wrapped in a `redirected_statement`
+//! (e.g. `for ... done > file`), the output redirection is propagated to the
+//! inner segments via [`ShellSegment::redirection`].  The eval layer uses this
+//! field to escalate decisions for commands that are contextually mutating even
+//! though their own text contains no redirect.
+//!
+//! # Substitution extraction
+//!
+//! Outermost `$()`, backtick, `<()`, and `>()` nodes are collected and their
+//! spans replaced with `__SUBST__` placeholders in the segment text.  The eval
+//! layer recursively evaluates each substitution's inner command independently.
+
 use super::types::{Operator, ParsedPipeline, Redirection, ShellSegment};
+use std::cell::RefCell;
+use tree_sitter::{Node, Parser, Tree};
 
-/// Result of parsing a heredoc at `<<DELIM`.
-///
-/// In shell, the text after the delimiter word on the same line is NOT part of
-/// the heredoc body — it's still live shell syntax (pipes, redirections, etc.).
-/// For example: `cat <<'EOF' | kubectl apply -f -`
-///   - `after_delim`: position right after the delimiter word (before ` | kubectl...`)
-///   - `body_end`: position after the closing delimiter line
-///   - `is_quoted`: whether the delimiter was quoted, suppressing expansion
-struct HeredocSpan {
-    after_delim: usize,
-    body_end: usize,
-    is_quoted: bool,
+// ---------------------------------------------------------------------------
+// Thread-local parser
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// tree-sitter `Parser` is `!Send`, so we use `thread_local!` storage.
+    static TS_PARSER: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        p.set_language(&tree_sitter_bash::LANGUAGE.into())
+            .expect("failed to load bash grammar");
+        p
+    });
 }
 
-/// When `<<` is encountered at `chars[start]`, parse the heredoc delimiter
-/// and find where the body ends.
+/// Parse `source` into a tree-sitter syntax tree.
+fn parse_tree(source: &str) -> Tree {
+    TS_PARSER.with(|p| {
+        p.borrow_mut()
+            .parse(source, None)
+            .expect("tree-sitter parse failed")
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Substitution extraction
+// ---------------------------------------------------------------------------
+
+/// A substitution's byte range in the source and its inner command text.
+struct SubstSpan {
+    start: usize,
+    end: usize,
+    inner: String,
+}
+
+/// Walk `node` for outermost `command_substitution` and `process_substitution`
+/// nodes, appending each to `out`.  Does not recurse into found substitutions;
+/// the eval layer handles nested evaluation.
+fn collect_substitutions(node: Node, source: &[u8], out: &mut Vec<SubstSpan>) {
+    if matches!(node.kind(), "command_substitution" | "process_substitution") {
+        let full = node.utf8_text(source).unwrap_or("");
+        let inner = strip_subst_delimiters(full);
+        if !inner.is_empty() {
+            out.push(SubstSpan {
+                start: node.start_byte(),
+                end: node.end_byte(),
+                inner: inner.to_string(),
+            });
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_substitutions(child, source, out);
+    }
+}
+
+/// Strip the outer delimiters from a substitution node's text.
 ///
-/// Returns `None` if not a valid heredoc (e.g., `<<<` here-string, missing delimiter).
-fn skip_heredoc(chars: &[char], start: usize) -> Option<HeredocSpan> {
-    let len = chars.len();
-    let mut i = start;
-
-    // Verify <<
-    if i + 1 >= len || chars[i] != '<' || chars[i + 1] != '<' {
-        return None;
-    }
-    i += 2;
-
-    // Reject <<< (here-string)
-    if i < len && chars[i] == '<' {
-        return None;
-    }
-
-    // Optional - for <<-
-    if i < len && chars[i] == '-' {
-        i += 1;
-    }
-
-    // Skip spaces/tabs before delimiter (not newlines)
-    while i < len && (chars[i] == ' ' || chars[i] == '\t') {
-        i += 1;
-    }
-
-    if i >= len || chars[i] == '\n' {
-        return None;
-    }
-
-    // Read delimiter word (possibly quoted)
-    let mut delimiter = String::new();
-    let mut is_quoted = false;
-
-    if chars[i] == '\'' {
-        is_quoted = true;
-        i += 1;
-        while i < len && chars[i] != '\'' && chars[i] != '\n' {
-            delimiter.push(chars[i]);
-            i += 1;
-        }
-        if i < len && chars[i] == '\'' {
-            i += 1;
-        }
-    } else if chars[i] == '"' {
-        is_quoted = true;
-        i += 1;
-        while i < len && chars[i] != '"' && chars[i] != '\n' {
-            delimiter.push(chars[i]);
-            i += 1;
-        }
-        if i < len && chars[i] == '"' {
-            i += 1;
-        }
+/// `$(cmd)` → `cmd`, `` `cmd` `` → `cmd`, `<(cmd)` / `>(cmd)` → `cmd`.
+fn strip_subst_delimiters(text: &str) -> &str {
+    let t = if text.starts_with("$(") || text.starts_with("<(") || text.starts_with(">(") {
+        text.get(2..text.len().saturating_sub(1)).unwrap_or("")
+    } else if text.starts_with('`') && text.ends_with('`') && text.len() >= 2 {
+        &text[1..text.len() - 1]
     } else {
-        while i < len && !chars[i].is_whitespace() {
-            delimiter.push(chars[i]);
-            i += 1;
+        text
+    };
+    t.trim()
+}
+
+/// Produce the text of `source[start..end]` with any substitution spans inside
+/// that range replaced by `__SUBST__` placeholders.  Replacement is performed
+/// right-to-left so that earlier byte offsets remain valid.
+fn text_replacing_substitutions(
+    source: &str,
+    start: usize,
+    end: usize,
+    subs: &[SubstSpan],
+) -> String {
+    let mut relevant: Vec<&SubstSpan> = subs
+        .iter()
+        .filter(|s| s.start >= start && s.end <= end)
+        .collect();
+    if relevant.is_empty() {
+        return source[start..end].to_string();
+    }
+    relevant.sort_by(|a, b| b.start.cmp(&a.start));
+    let mut text = source[start..end].to_string();
+    for sub in relevant {
+        text.replace_range((sub.start - start)..(sub.end - start), "__SUBST__");
+    }
+    text
+}
+
+// ---------------------------------------------------------------------------
+// Output redirection detection
+// ---------------------------------------------------------------------------
+
+/// Inspect a `file_redirect` AST node and decide whether it represents an
+/// output redirection that could mutate filesystem state.
+///
+/// # Safe patterns (returns `None`)
+///
+/// - Input redirects: `<`, `<<`, `<<<`, `<&`
+/// - Any redirect targeting `/dev/null`
+/// - fd duplication to standard streams: `>&1`, `>&2`, `2>&1`, etc.
+/// - fd closing: `>&-`, `2>&-`
+///
+/// # Flagged patterns (returns `Some`)
+///
+/// - `>`, `>>` to any path other than `/dev/null`
+/// - `&>`, `&>>` to any path other than `/dev/null`
+/// - `>&N` or `M>&N` where N ≥ 3 (custom fd target)
+/// - `N>` or `N>>` to any path other than `/dev/null`
+fn check_file_redirect(node: Node, source: &[u8]) -> Option<Redirection> {
+    let mut fd: Option<String> = None;
+    let mut operator = "";
+    let mut dest = String::new();
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "file_descriptor" {
+            fd = child.utf8_text(source).ok().map(str::to_string);
+        } else if child.is_named() {
+            dest = child.utf8_text(source).unwrap_or("").to_string();
+        } else {
+            let k = child.kind();
+            if matches!(
+                k,
+                ">" | ">>" | "&>" | "&>>" | ">&" | "<" | "<<<" | "<<" | "<&"
+            ) {
+                operator = k;
+            }
         }
     }
 
-    if delimiter.is_empty() {
+    if matches!(operator, "" | "<" | "<<<" | "<<" | "<&") {
         return None;
     }
 
-    // Mark position right after delimiter word — the rest of this line
-    // is still live shell syntax (pipes, redirections, etc.)
-    let after_delim = i;
-
-    // Skip to end of current line (heredoc body starts on next line)
-    while i < len && chars[i] != '\n' {
-        i += 1;
-    }
-    if i < len {
-        i += 1; // skip \n
+    if matches!(operator, "&>" | "&>>") {
+        if dest == "/dev/null" {
+            return None;
+        }
+        return Some(Redirection {
+            description: format!("output redirection ({operator})"),
+        });
     }
 
-    // Scan lines for the closing delimiter
-    let delim_chars: Vec<char> = delimiter.chars().collect();
-    while i < len {
-        // Check if this line matches the delimiter exactly
-        let check = i;
-        let mut matches = check + delim_chars.len() <= len;
-        if matches {
-            for (j, dc) in delim_chars.iter().enumerate() {
-                if chars[check + j] != *dc {
-                    matches = false;
-                    break;
-                }
-            }
+    if operator == ">&" {
+        if dest == "-" {
+            return None;
         }
-        if matches {
-            let after = check + delim_chars.len();
-            if after >= len || chars[after] == '\n' {
-                let body_end = if after < len { after + 1 } else { after };
-                return Some(HeredocSpan { after_delim, body_end, is_quoted });
-            }
-        }
-
-        // Skip to next line
-        while i < len && chars[i] != '\n' {
-            i += 1;
-        }
-        if i < len {
-            i += 1;
-        }
-    }
-
-    // Delimiter not found — treat rest as heredoc body
-    Some(HeredocSpan { after_delim, body_end: len, is_quoted })
-}
-
-/// Split a command at shell operators (&&, ||, ;, |, |&),
-/// respecting single/double quotes and backslash escapes.
-///
-/// Returns segments and the operators between them.
-fn split_compound_command(command: &str) -> (Vec<String>, Vec<Operator>) {
-    let mut parts = Vec::new();
-    let mut operators = Vec::new();
-    let mut buf = String::new();
-
-    let chars: Vec<char> = command.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-    let (mut sq, mut dq, mut esc) = (false, false, false);
-
-    while i < len {
-        let c = chars[i];
-
-        if esc {
-            buf.push(c);
-            esc = false;
-            i += 1;
-            continue;
-        }
-        if c == '\\' && !sq {
-            esc = true;
-            buf.push(c);
-            i += 1;
-            continue;
-        }
-        if c == '\'' && !dq {
-            sq = !sq;
-            buf.push(c);
-            i += 1;
-            continue;
-        }
-        if c == '"' && !sq {
-            dq = !dq;
-            buf.push(c);
-            i += 1;
-            continue;
-        }
-        if sq || dq {
-            buf.push(c);
-            i += 1;
-            continue;
-        }
-
-        // Heredoc: include <<DELIM token, let rest of line be processed
-        // normally for operators, then skip the body entirely.
-        if c == '<' && i + 1 < len && chars[i + 1] == '<'
-            && let Some(span) = skip_heredoc(&chars, i)
-        {
-            // Push the <<DELIM token (up to after_delim)
-            for ch in &chars[i..span.after_delim] {
-                buf.push(*ch);
-            }
-            // Record that we need to skip the heredoc body later
-            // For now, continue processing the rest of the <<DELIM line
-            // for operators. We'll find the \n and then jump to body_end.
-            //
-            // Strategy: replace heredoc body (from the \n after the DELIM
-            // line through body_end) with nothing — just advance past it.
-            // But we need to let the rest of this line be processed first.
-            // So we stash the body_end and jump there when we hit \n.
-            //
-            // Simplest approach: scan rest of line normally for operators,
-            // then when we find \n, jump to body_end instead of i+1.
-            i = span.after_delim;
-            // Find end of current line, processing operators along the way
-            while i < len && chars[i] != '\n' {
-                let c2 = chars[i];
-
-                // Two-char operators on same line as heredoc
-                if i + 1 < len {
-                    let next2 = chars[i + 1];
-                    let op = match (c2, next2) {
-                        ('&', '&') => Some(Operator::And),
-                        ('|', '|') => Some(Operator::Or),
-                        ('|', '&') => Some(Operator::PipeErr),
-                        _ => None,
-                    };
-                    if let Some(op) = op {
-                        let trimmed = buf.trim().to_string();
-                        parts.push(trimmed);
-                        operators.push(op);
-                        buf.clear();
-                        i += 2;
-                        continue;
-                    }
-                }
-
-                // Single-char operators on same line as heredoc
-                match c2 {
-                    '|' => {
-                        let trimmed = buf.trim().to_string();
-                        parts.push(trimmed);
-                        operators.push(Operator::Pipe);
-                        buf.clear();
-                        i += 1;
-                        continue;
-                    }
-                    ';' => {
-                        let trimmed = buf.trim().to_string();
-                        parts.push(trimmed);
-                        operators.push(Operator::Semi);
-                        buf.clear();
-                        i += 1;
-                        continue;
-                    }
-                    _ => {
-                        buf.push(c2);
-                        i += 1;
-                    }
-                }
-            }
-            // Skip heredoc body: jump from end-of-line to body_end
-            i = span.body_end;
-            continue;
-        }
-
-        // Two-char operators
-        if i + 1 < len {
-            let next = chars[i + 1];
-            let op = match (c, next) {
-                ('&', '&') => Some(Operator::And),
-                ('|', '|') => Some(Operator::Or),
-                ('|', '&') => Some(Operator::PipeErr),
-                _ => None,
-            };
-            if let Some(op) = op {
-                let trimmed = buf.trim().to_string();
-                parts.push(trimmed);
-                operators.push(op);
-                buf.clear();
-                i += 2;
-                continue;
-            }
-        }
-
-        // Single-char operators
-        match c {
-            '|' => {
-                let trimmed = buf.trim().to_string();
-                parts.push(trimmed);
-                operators.push(Operator::Pipe);
-                buf.clear();
-                i += 1;
-                continue;
-            }
-            ';' => {
-                let trimmed = buf.trim().to_string();
-                parts.push(trimmed);
-                operators.push(Operator::Semi);
-                buf.clear();
-                i += 1;
-                continue;
-            }
-            _ => {}
-        }
-
-        buf.push(c);
-        i += 1;
-    }
-
-    let tail = buf.trim().to_string();
-    if !tail.is_empty() {
-        parts.push(tail);
-    }
-
-    // Filter empties
-    parts.retain(|p| !p.is_empty());
-
-    (parts, operators)
-}
-
-/// Extract command substitution contents from `$(...)` and backticks.
-/// Returns the outer command with substitutions replaced by `__SUBST__`
-/// placeholders, plus a vec of the extracted inner command strings.
-///
-/// Handles nesting: `$(cat $(which foo))` extracts `cat $(which foo)`,
-/// which is then recursively evaluated by `evaluate()`.
-///
-/// `$()` is extracted even inside double quotes (shell expands it there).
-/// Only single quotes block substitution detection.
-fn extract_substitutions(command: &str) -> (String, Vec<String>) {
-    let chars: Vec<char> = command.chars().collect();
-    let len = chars.len();
-    let mut outer = String::new();
-    let mut inners = Vec::new();
-    let mut i = 0;
-    let (mut sq, mut dq, mut esc) = (false, false, false);
-    let mut heredoc_body_end: Option<usize> = None;
-
-    while i < len {
-        let c = chars[i];
-
-        if esc {
-            outer.push(c);
-            esc = false;
-            i += 1;
-            continue;
-        }
-        if c == '\\' && !sq {
-            esc = true;
-            outer.push(c);
-            i += 1;
-            continue;
-        }
-        if c == '\'' && !dq {
-            sq = !sq;
-            outer.push(c);
-            i += 1;
-            continue;
-        }
-        if c == '"' && !sq {
-            dq = !dq;
-            outer.push(c);
-            i += 1;
-            continue;
-        }
-        // Single quotes block all substitution
-        if sq {
-            outer.push(c);
-            i += 1;
-            continue;
-        }
-
-        // Heredoc with quoted delimiter: skip body (no expansion).
-        // Unquoted heredocs fall through — their bodies DO expand substitutions.
-        // In both cases, the rest of the <<DELIM line is still live syntax.
-        if c == '<' && !dq && i + 1 < len && chars[i + 1] == '<'
-            && let Some(span) = skip_heredoc(&chars, i)
-            && span.is_quoted
-        {
-            // Push <<DELIM token
-            for ch in &chars[i..span.after_delim] {
-                outer.push(*ch);
-            }
-            // Skip past the <<DELIM token; the outer loop will process the
-            // rest of the line normally (handling $(), backticks, etc.).
-            // When we hit \n, we jump over the heredoc body.
-            i = span.after_delim;
-            heredoc_body_end = Some(span.body_end);
-            continue;
-        }
-
-        // If we're on a heredoc-bearing line and hit \n, skip the body.
-        if c == '\n' && let Some(body_end) = heredoc_body_end.take() {
-            outer.push('\n');
-            i = body_end;
-            continue;
-        }
-
-        // $( — extract balanced content
-        if c == '$' && i + 1 < len && chars[i + 1] == '(' {
-            let mut depth: u32 = 1;
-            let mut inner = String::new();
-            let (mut isq, mut idq, mut iesc) = (false, false, false);
-            i += 2; // skip $(
-            while i < len && depth > 0 {
-                let ic = chars[i];
-                if iesc {
-                    inner.push(ic);
-                    iesc = false;
-                    i += 1;
-                    continue;
-                }
-                if ic == '\\' && !isq {
-                    iesc = true;
-                    inner.push(ic);
-                    i += 1;
-                    continue;
-                }
-                if ic == '\'' && !idq {
-                    isq = !isq;
-                    inner.push(ic);
-                    i += 1;
-                    continue;
-                }
-                if ic == '"' && !isq {
-                    idq = !idq;
-                    inner.push(ic);
-                    i += 1;
-                    continue;
-                }
-                if !isq && !idq {
-                    if ic == '(' {
-                        depth += 1;
-                    }
-                    if ic == ')' {
-                        depth -= 1;
-                        if depth == 0 {
-                            i += 1;
-                            break;
-                        }
-                    }
-                }
-                inner.push(ic);
-                i += 1;
-            }
-            let trimmed = inner.trim().to_string();
-            if !trimmed.is_empty() {
-                inners.push(trimmed);
-            }
-            outer.push_str("__SUBST__");
-            continue;
-        }
-
-        // Backtick — extract to matching backtick (no nesting)
-        if c == '`' {
-            let mut inner = String::new();
-            i += 1; // skip opening `
-            while i < len && chars[i] != '`' {
-                if chars[i] == '\\' && i + 1 < len {
-                    inner.push(chars[i]);
-                    inner.push(chars[i + 1]);
-                    i += 2;
-                    continue;
-                }
-                inner.push(chars[i]);
-                i += 1;
-            }
-            if i < len {
-                i += 1; // skip closing `
-            }
-            let trimmed = inner.trim().to_string();
-            if !trimmed.is_empty() {
-                inners.push(trimmed);
-            }
-            outer.push_str("__SUBST__");
-            continue;
-        }
-
-        // Process substitution <() / >() — extract inner command
-        if (c == '<' || c == '>') && i + 1 < len && chars[i + 1] == '(' && !dq {
-            let mut depth: u32 = 1;
-            let mut inner = String::new();
-            let (mut isq, mut idq, mut iesc) = (false, false, false);
-            i += 2; // skip <( or >(
-            while i < len && depth > 0 {
-                let ic = chars[i];
-                if iesc {
-                    inner.push(ic);
-                    iesc = false;
-                    i += 1;
-                    continue;
-                }
-                if ic == '\\' && !isq {
-                    iesc = true;
-                    inner.push(ic);
-                    i += 1;
-                    continue;
-                }
-                if ic == '\'' && !idq {
-                    isq = !isq;
-                    inner.push(ic);
-                    i += 1;
-                    continue;
-                }
-                if ic == '"' && !isq {
-                    idq = !idq;
-                    inner.push(ic);
-                    i += 1;
-                    continue;
-                }
-                if !isq && !idq {
-                    if ic == '(' {
-                        depth += 1;
-                    }
-                    if ic == ')' {
-                        depth -= 1;
-                        if depth == 0 {
-                            i += 1;
-                            break;
-                        }
-                    }
-                }
-                inner.push(ic);
-                i += 1;
-            }
-            let trimmed = inner.trim().to_string();
-            if !trimmed.is_empty() {
-                inners.push(trimmed);
-            }
-            // Don't include < or > prefix — would false-trigger redirection detection
-            outer.push_str("__SUBST__");
-            continue;
-        }
-
-        outer.push(c);
-        i += 1;
-    }
-
-    (outer, inners)
-}
-
-/// Skip past `>` or `>>` and any whitespace, then collect the unquoted target word.
-/// Returns the target path (e.g. "/dev/null", "file.txt") or empty string if nothing follows.
-fn extract_redir_target(chars: &[char], start: usize) -> String {
-    let len = chars.len();
-    let mut i = start;
-    // Skip past > or >>
-    if i < len && chars[i] == '>' {
-        i += 1;
-    }
-    if i < len && chars[i] == '>' {
-        i += 1; // >>
-    }
-    // Skip whitespace
-    while i < len && (chars[i] == ' ' || chars[i] == '\t') {
-        i += 1;
-    }
-    // Collect target word (unquoted for now — sufficient for /dev/null detection)
-    let mut target = String::new();
-    while i < len && !chars[i].is_whitespace() && chars[i] != ';' && chars[i] != '|' && chars[i] != '&' {
-        target.push(chars[i]);
-        i += 1;
-    }
-    target
-}
-
-/// Returns true if an fd number (0-9) refers to a standard stream (stdin/stdout/stderr).
-/// Custom fd numbers (3+) are NOT considered safe for duplication targets because they
-/// could have been redirected to files earlier in the same compound command
-/// (e.g. `exec 3>/tmp/evil && cmd >&3`).
-fn is_standard_fd(c: char) -> bool {
-    c == '0' || c == '1' || c == '2'
-}
-
-/// Detect output redirection (>, >>, &>, fd>) outside quotes.
-/// Does NOT flag:
-///   - Input redirection (<) or here-docs (<<, <<<)
-///   - Redirection to /dev/null (discarding output is not mutating)
-///   - fd-to-fd duplication to standard streams: >&1, >&2, N>&1, N>&2
-///   - fd closing: >&-, N>&-
-///
-/// DOES flag (conservatively):
-///   - >&N where N >= 3 (custom fds could point to files)
-///   - N>&M where M >= 3 (same reason)
-pub fn has_output_redirection(command: &str) -> Option<Redirection> {
-    let chars: Vec<char> = command.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-    let (mut sq, mut dq, mut esc) = (false, false, false);
-    let mut heredoc_body_end: Option<usize> = None;
-
-    while i < len {
-        let c = chars[i];
-
-        if esc {
-            esc = false;
-            i += 1;
-            continue;
-        }
-        if c == '\\' && !sq {
-            esc = true;
-            i += 1;
-            continue;
-        }
-        if c == '\'' && !dq {
-            sq = !sq;
-            i += 1;
-            continue;
-        }
-        if c == '"' && !sq {
-            dq = !dq;
-            i += 1;
-            continue;
-        }
-        if sq || dq {
-            i += 1;
-            continue;
-        }
-
-        // Heredoc: skip only the body to avoid false redirection detection
-        // inside it (e.g. <noreply@anthropic.com> in a commit message).
-        // The rest of the <<DELIM line is still live syntax and must be scanned
-        // for actual redirections (e.g. `cat <<EOF > file`).
-        if c == '<' && i + 1 < len && chars[i + 1] == '<'
-            && let Some(span) = skip_heredoc(&chars, i)
-        {
-            // Skip past <<DELIM token only
-            i = span.after_delim;
-            // Scan rest of line normally (the outer loop handles it),
-            // then skip the heredoc body when we hit the newline.
-            // We store body_end and check for newline transitions below.
-            heredoc_body_end = Some(span.body_end);
-            continue;
-        }
-
-        // If we're inside a heredoc-bearing line and hit \n, skip the body.
-        if c == '\n' && let Some(body_end) = heredoc_body_end.take() {
-            i = body_end;
-            continue;
-        }
-
-        // &> or &>> (redirect both stdout+stderr to file)
-        if c == '&' && i + 1 < len && chars[i + 1] == '>' {
-            let target = extract_redir_target(&chars, i + 1);
-            if target == "/dev/null" {
-                // Skip past &> /dev/null
-                i += 2;
-                continue;
+        if let Some(ref f) = fd {
+            if matches!(dest.as_str(), "0" | "1" | "2") {
+                return None;
             }
             return Some(Redirection {
-                description: "output redirection (&>)".into(),
+                description: format!("output redirection ({f}>&{dest}, custom fd target)"),
             });
         }
+        if matches!(dest.as_str(), "0" | "1" | "2") {
+            return None;
+        }
+        return Some(Redirection {
+            description: format!("output redirection (>&{dest}, custom fd target)"),
+        });
+    }
 
-        // fd redirects: N>, N>>, N>&M, N>&-
-        if c.is_ascii_digit() && i + 1 < len && chars[i + 1] == '>' {
-            // N>&- is fd closing — always safe
-            if i + 2 < len
-                && chars[i + 2] == '&'
-                && i + 3 < len
-                && chars[i + 3] == '-'
-            {
-                i += 4;
-                continue;
-            }
-            // N>&M — safe only when M is a standard fd (0-2)
-            if i + 2 < len
-                && chars[i + 2] == '&'
-                && i + 3 < len
-                && chars[i + 3].is_ascii_digit()
-            {
-                if is_standard_fd(chars[i + 3]) {
-                    i += 4;
-                    continue;
-                }
-                return Some(Redirection {
-                    description: format!("output redirection ({c}>&{}, custom fd target)", chars[i + 3]),
-                });
-            }
-            // N> file or N>> file — check for /dev/null
-            let target = extract_redir_target(&chars, i + 1);
-            if target == "/dev/null" {
-                i += 2;
-                continue;
-            }
+    if matches!(operator, ">" | ">>") {
+        if dest == "/dev/null" {
+            return None;
+        }
+        if let Some(ref f) = fd {
             return Some(Redirection {
-                description: format!("output redirection ({c}>)"),
+                description: format!("output redirection ({f}{operator})"),
             });
         }
-
-        // > or >> but NOT >( (process substitution), >&N, or >&-
-        if c == '>' {
-            if i + 1 < len && chars[i + 1] == '(' {
-                i += 1;
-                continue;
-            }
-            // >&- is fd closing — always safe
-            if i + 1 < len
-                && chars[i + 1] == '&'
-                && i + 2 < len
-                && chars[i + 2] == '-'
-            {
-                i += 3;
-                continue;
-            }
-            // >&N — safe only when N is a standard fd (0-2)
-            if i + 1 < len
-                && chars[i + 1] == '&'
-                && i + 2 < len
-                && chars[i + 2].is_ascii_digit()
-            {
-                if is_standard_fd(chars[i + 2]) {
-                    i += 3;
-                    continue;
-                }
-                return Some(Redirection {
-                    description: format!("output redirection (>&{}, custom fd target)", chars[i + 2]),
-                });
-            }
-            // > file or >> file — check for /dev/null
-            let target = extract_redir_target(&chars, i);
-            if target == "/dev/null" {
-                i += 1;
-                continue;
-            }
-            return Some(Redirection {
-                description: "output redirection (>)".into(),
-            });
-        }
-
-        i += 1;
+        return Some(Redirection {
+            description: format!("output redirection ({operator})"),
+        });
     }
 
     None
 }
 
-/// Parse a full command string into a pipeline and its top-level substitutions.
-///
-/// Extracts substitutions first, then splits at compound operators.
-/// Each segment carries its redirection state.
-pub fn parse_with_substitutions(command: &str) -> (ParsedPipeline, Vec<String>) {
-    let (outer, substitutions) = extract_substitutions(command);
-    let (parts, operators) = split_compound_command(&outer);
+/// Recursively search `node` for `file_redirect` descendants, returning the
+/// first output redirection found.  Skips `heredoc_body` subtrees entirely so
+/// that text inside heredoc bodies (e.g. email addresses containing `>`) never
+/// triggers a false positive.
+fn detect_redirections(node: Node, source: &[u8]) -> Option<Redirection> {
+    if node.kind() == "file_redirect" {
+        return check_file_redirect(node, source);
+    }
+    if node.kind() == "heredoc_body" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(r) = detect_redirections(child, source) {
+            return Some(r);
+        }
+    }
+    None
+}
 
-    if parts.len() <= 1 && substitutions.is_empty() {
-        let redir = has_output_redirection(command);
+// ---------------------------------------------------------------------------
+// AST walking — compound command decomposition
+// ---------------------------------------------------------------------------
+
+/// Intermediate result of walking a subtree: a flat sequence of segment byte
+/// ranges interleaved with operators.
+struct WalkResult {
+    segments: Vec<SegmentInfo>,
+    operators: Vec<Operator>,
+}
+
+/// A segment's position in the source and any redirection inherited from a
+/// wrapping `redirected_statement`.
+struct SegmentInfo {
+    start: usize,
+    end: usize,
+    redirection: Option<Redirection>,
+}
+
+impl WalkResult {
+    fn empty() -> Self {
+        Self {
+            segments: vec![],
+            operators: vec![],
+        }
+    }
+
+    fn single(start: usize, end: usize, redir: Option<Redirection>) -> Self {
+        Self {
+            segments: vec![SegmentInfo {
+                start,
+                end,
+                redirection: redir,
+            }],
+            operators: vec![],
+        }
+    }
+
+    /// Merge `other` into `self`, inserting `join_op` between the two if both
+    /// contain segments.
+    fn append(&mut self, other: WalkResult, join_op: Option<Operator>) {
+        if other.segments.is_empty() {
+            return;
+        }
+        if !self.segments.is_empty()
+            && let Some(op) = join_op
+        {
+            self.operators.push(op);
+        }
+        self.segments.extend(other.segments);
+        self.operators.extend(other.operators);
+    }
+}
+
+/// Dispatch on the AST `node` kind and return a flat segment/operator sequence.
+///
+/// The match arms fall into three categories:
+///
+/// 1. **Structure nodes** (`program`, `list`, `pipeline`) — decompose into
+///    children connected by operators.
+/// 2. **Leaf command nodes** (`command`, `declaration_command`,
+///    `variable_assignment`) — become a single segment whose byte range is the
+///    node's span.
+/// 3. **Control flow nodes** (`for_statement`, `if_statement`, etc.) — recurse
+///    into their body to extract the actual commands.
+///
+/// Unknown named nodes are treated as single segments (conservative: the eval
+/// layer will flag them as unrecognized → ASK).
+fn walk_ast(node: Node, source: &[u8]) -> WalkResult {
+    match node.kind() {
+        "program" => walk_program(node, source),
+        "list" => walk_list(node, source),
+        "pipeline" => walk_pipeline(node, source),
+        "command" | "declaration_command" => {
+            let redir = detect_redirections(node, source);
+            WalkResult::single(node.start_byte(), node.end_byte(), redir)
+        }
+        "redirected_statement" => walk_redirected(node, source),
+        "for_statement" | "while_statement" | "until_statement" | "c_style_for_statement" => {
+            walk_loop(node, source)
+        }
+        "if_statement" => walk_if(node, source),
+        "case_statement" => walk_case(node, source),
+        "subshell" | "compound_statement" | "do_group" | "else_clause" | "elif_clause"
+        | "case_item" => walk_block(node, source),
+        "negated_command" => walk_negated(node, source),
+        "function_definition" => walk_function(node, source),
+        "variable_assignment" => WalkResult::single(node.start_byte(), node.end_byte(), None),
+        "comment" | "heredoc_body" => WalkResult::empty(),
+        _ if node.is_named() => {
+            WalkResult::single(node.start_byte(), node.end_byte(), None)
+        }
+        _ => WalkResult::empty(),
+    }
+}
+
+/// Top-level `program` node: join named children with [`Operator::Semi`].
+fn walk_program(node: Node, source: &[u8]) -> WalkResult {
+    let mut result = WalkResult::empty();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        result.append(walk_ast(child, source), Some(Operator::Semi));
+    }
+    result
+}
+
+/// `list` is a left-recursive binary tree: `a && b || c` parses as
+/// `list(list(a, &&, b), ||, c)`.  This function flattens it into a linear
+/// segment/operator sequence.
+fn walk_list(node: Node, source: &[u8]) -> WalkResult {
+    let mut cursor = node.walk();
+    let named: Vec<Node> = node.named_children(&mut cursor).collect();
+    if named.len() < 2 {
+        let mut result = WalkResult::empty();
+        for child in named {
+            result.append(walk_ast(child, source), Some(Operator::Semi));
+        }
+        return result;
+    }
+    let op = list_operator(node);
+    let mut result = walk_ast(named[0], source);
+    result.append(walk_ast(named[1], source), Some(op));
+    result
+}
+
+/// Extract the operator from a `list` node's anonymous children.
+fn list_operator(node: Node) -> Operator {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() {
+            match child.kind() {
+                "&&" => return Operator::And,
+                "||" => return Operator::Or,
+                _ => {}
+            }
+        }
+    }
+    Operator::Semi
+}
+
+/// `pipeline` node: named children are commands, anonymous `|` / `|&` tokens
+/// are the operators between them.
+fn walk_pipeline(node: Node, source: &[u8]) -> WalkResult {
+    let mut result = WalkResult::empty();
+    let mut pending_op: Option<Operator> = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.is_named() {
+            result.append(walk_ast(child, source), pending_op.take());
+        } else {
+            match child.kind() {
+                "|" => pending_op = Some(Operator::Pipe),
+                "|&" => pending_op = Some(Operator::PipeErr),
+                _ => {}
+            }
+        }
+    }
+    result
+}
+
+/// `redirected_statement` wraps a body node (command, pipeline, control flow,
+/// etc.) together with one or more redirect nodes (`file_redirect`,
+/// `heredoc_redirect`, `herestring_redirect`).
+///
+/// For a leaf command body, the full `redirected_statement` text (minus any
+/// heredoc body content) becomes the segment text — this preserves redirect
+/// tokens like `> file` in the text that downstream `base_command()` and
+/// `has_output_redirection()` will see.
+///
+/// For a compound body (e.g. `for ... done > file`), the walker recurses into
+/// the body and propagates the detected redirection to each inner segment.
+///
+/// `heredoc_redirect` nodes may contain same-line pipeline/list children
+/// (e.g. `cat <<EOF | grep foo` produces a `pipeline` inside
+/// `heredoc_redirect`).  These are checked **first** because the body
+/// command (e.g. `cat`) appears as an earlier sibling and would otherwise
+/// trigger the leaf-command short-circuit.
+fn walk_redirected(node: Node, source: &[u8]) -> WalkResult {
+    let redir = detect_redirections(node, source);
+
+    // First pass: check if any heredoc_redirect contains same-line commands.
+    // This must run before the leaf-command path because tree-sitter places
+    // `cat <<EOF | cmd` as: redirected_statement { command("cat"),
+    // heredoc_redirect { pipeline("| cmd") } }.  The command("cat") child
+    // would otherwise trigger an early return.
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "heredoc_redirect" {
+            let inner = walk_heredoc_redirect(child, source);
+            if !inner.segments.is_empty() {
+                let mut full = WalkResult::empty();
+                // Find the body command (sibling before heredoc_redirect).
+                let mut c2 = node.walk();
+                for sib in node.named_children(&mut c2) {
+                    if sib.kind() == "heredoc_redirect" {
+                        break;
+                    }
+                    if matches!(sib.kind(), "file_redirect" | "herestring_redirect") {
+                        continue;
+                    }
+                    let end = effective_end(node).min(child.start_byte());
+                    full.append(
+                        WalkResult::single(sib.start_byte(), end, redir.clone()),
+                        None,
+                    );
+                    break;
+                }
+                // The first operator token in heredoc_redirect determines how
+                // the body command joins the same-line content.
+                let join_op = heredoc_join_operator(child);
+                full.append(inner, Some(join_op));
+                return full;
+            }
+        }
+    }
+
+    // Second pass: no heredoc piped content.  Handle body normally.
+    let mut cursor2 = node.walk();
+    for child in node.named_children(&mut cursor2) {
+        if matches!(
+            child.kind(),
+            "file_redirect" | "herestring_redirect" | "heredoc_redirect"
+        ) {
+            continue;
+        }
+        if is_leaf_command(child) {
+            let end = effective_end(node);
+            return WalkResult::single(node.start_byte(), end, redir);
+        }
+        // Compound body (e.g. for loop with redirect).
+        let mut result = walk_ast(child, source);
+        if let Some(ref r) = redir {
+            for seg in &mut result.segments {
+                if seg.redirection.is_none() {
+                    seg.redirection = Some(r.clone());
+                }
+            }
+        }
+        return result;
+    }
+
+    // Fallback: no recognized body.
+    let end = effective_end(node);
+    WalkResult::single(node.start_byte(), end, redir)
+}
+
+/// Walk a `heredoc_redirect` node for commands that appear on the same line
+/// as the heredoc marker.
+///
+/// In tree-sitter-bash, `cat <<EOF | grep foo` places the `| grep foo`
+/// pipeline inside the `heredoc_redirect` node rather than as a sibling in an
+/// outer pipeline.  Similarly, `cat <<EOF && rm file` places `&& rm file` as
+/// an anonymous operator token + named `command` child.
+///
+/// For parse errors (e.g. `;` in heredoc context), commands may appear as
+/// loose `word` nodes.  These are collected into a synthetic segment so the
+/// eval layer can flag them.
+fn walk_heredoc_redirect(node: Node, source: &[u8]) -> WalkResult {
+    let mut result = WalkResult::empty();
+    let mut cursor = node.walk();
+    let mut loose_words_start: Option<usize> = None;
+    let mut loose_words_end: usize = 0;
+
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "pipeline" | "list" | "command" | "redirected_statement" => {
+                // Flush accumulated loose words as a segment.
+                if let Some(start) = loose_words_start.take() {
+                    result.append(
+                        WalkResult::single(start, loose_words_end, None),
+                        Some(Operator::Semi),
+                    );
+                }
+                let op = heredoc_operator_before(node, child);
+                result.append(walk_ast(child, source), Some(op));
+            }
+            "word" => {
+                if loose_words_start.is_none() {
+                    loose_words_start = Some(child.start_byte());
+                }
+                loose_words_end = child.end_byte();
+            }
+            _ => {}
+        }
+    }
+
+    // Flush any trailing loose words.
+    if let Some(start) = loose_words_start {
+        result.append(
+            WalkResult::single(start, loose_words_end, None),
+            Some(Operator::Semi),
+        );
+    }
+
+    result
+}
+
+/// Determine the operator that precedes `child` inside a `heredoc_redirect`.
+///
+/// Scans the anonymous children of `heredoc_node` for operator tokens (`&&`,
+/// `||`, `|`, `|&`) that appear before `child`.  Returns the corresponding
+/// [`Operator`], defaulting to [`Operator::Pipe`] when no explicit operator is
+/// found (the most common heredoc pattern is piping).
+fn heredoc_operator_before(heredoc_node: Node, child: Node) -> Operator {
+    let mut cursor = heredoc_node.walk();
+    let mut last_op = None;
+    for sib in heredoc_node.children(&mut cursor) {
+        if sib.start_byte() >= child.start_byte() {
+            break;
+        }
+        if !sib.is_named() {
+            match sib.kind() {
+                "&&" => last_op = Some(Operator::And),
+                "||" => last_op = Some(Operator::Or),
+                "|&" => last_op = Some(Operator::PipeErr),
+                "|" => last_op = Some(Operator::Pipe),
+                _ => {}
+            }
+        }
+    }
+    last_op.unwrap_or(Operator::Pipe)
+}
+
+/// Determine the operator joining the body command to same-line heredoc content.
+///
+/// Checks direct children of the `heredoc_redirect` node: anonymous operator
+/// tokens (`&&`, `||`, `|&`) and named `pipeline` children (which imply `|`).
+/// Returns [`Operator::Pipe`] as default since piping from a heredoc is the
+/// most common pattern.
+fn heredoc_join_operator(heredoc_node: Node) -> Operator {
+    let mut cursor = heredoc_node.walk();
+    for child in heredoc_node.children(&mut cursor) {
+        if !child.is_named() {
+            match child.kind() {
+                "&&" => return Operator::And,
+                "||" => return Operator::Or,
+                "|&" => return Operator::PipeErr,
+                _ => {}
+            }
+        } else {
+            match child.kind() {
+                "pipeline" => return Operator::Pipe,
+                "command" | "list" | "redirected_statement" => break,
+                _ => {}
+            }
+        }
+    }
+    Operator::Pipe
+}
+
+/// `for_statement`, `while_statement`, `until_statement`, `c_style_for_statement`:
+/// recurse into child nodes to extract evaluable commands.
+///
+/// For `while` and `until`, the condition is itself a command (e.g. `true`,
+/// `test -f foo`) and must be evaluated alongside the body.  For `for` and
+/// `c_style_for`, non-`do_group` children are variable names and word lists,
+/// not commands.
+fn walk_loop(node: Node, source: &[u8]) -> WalkResult {
+    let mut result = WalkResult::empty();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "do_group" => result.append(walk_block(child, source), Some(Operator::Semi)),
+            _ if node.kind() == "while_statement" || node.kind() == "until_statement" => {
+                result.append(walk_ast(child, source), Some(Operator::Semi));
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
+/// `if_statement`: extract commands from the condition, then-body, and any
+/// else/elif clauses.
+fn walk_if(node: Node, source: &[u8]) -> WalkResult {
+    let mut result = WalkResult::empty();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "command" | "declaration_command" | "pipeline" | "list"
+            | "redirected_statement" | "compound_statement" | "subshell"
+            | "negated_command" => {
+                result.append(walk_ast(child, source), Some(Operator::Semi));
+            }
+            "else_clause" | "elif_clause" => {
+                result.append(walk_ast(child, source), Some(Operator::Semi));
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
+/// `case_statement`: recurse into each `case_item`.
+fn walk_case(node: Node, source: &[u8]) -> WalkResult {
+    let mut result = WalkResult::empty();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "case_item" {
+            result.append(walk_block(child, source), Some(Operator::Semi));
+        }
+    }
+    result
+}
+
+/// Generic block walk: recurse into all named children, joining with
+/// [`Operator::Semi`].  Used for `do_group`, `else_clause`, `elif_clause`,
+/// `case_item`, `subshell`, and `compound_statement`.
+fn walk_block(node: Node, source: &[u8]) -> WalkResult {
+    let mut result = WalkResult::empty();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        result.append(walk_ast(child, source), Some(Operator::Semi));
+    }
+    result
+}
+
+/// `negated_command` (`! cmd`): walk the first named child (the negated body).
+fn walk_negated(node: Node, source: &[u8]) -> WalkResult {
+    let mut cursor = node.walk();
+    if let Some(child) = node.named_children(&mut cursor).next() {
+        return walk_ast(child, source);
+    }
+    WalkResult::empty()
+}
+
+/// `function_definition`: recurse into the `compound_statement` body.
+fn walk_function(node: Node, source: &[u8]) -> WalkResult {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "compound_statement" {
+            return walk_block(child, source);
+        }
+    }
+    WalkResult::empty()
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// True for node kinds that represent a single evaluable command.
+fn is_leaf_command(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        "command" | "declaration_command" | "variable_assignment"
+    )
+}
+
+/// Return the effective end byte of `node`, excluding any `heredoc_body`
+/// descendant.  This trims heredoc body content from segment text so that only
+/// the command line (including the `<<DELIM` token) is included.
+fn effective_end(node: Node) -> usize {
+    let mut end = node.end_byte();
+    trim_at_heredoc_body(node, &mut end);
+    end
+}
+
+fn trim_at_heredoc_body(node: Node, end: &mut usize) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "heredoc_body" {
+            *end = (*end).min(child.start_byte());
+            return;
+        }
+        trim_at_heredoc_body(child, end);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Parse a shell command string into a pipeline of segments and a list of
+/// extracted substitution contents.
+///
+/// # Returns
+///
+/// `(pipeline, substitutions)` where:
+///
+/// - `pipeline.segments` — one [`ShellSegment`] per evaluable command, with
+///   `__SUBST__` placeholders where substitutions were extracted.
+/// - `pipeline.operators` — the shell operators (`&&`, `||`, `;`, `|`, `|&`)
+///   between consecutive segments.
+/// - `substitutions` — the inner command text of each outermost `$()`,
+///   backtick, `<()`, or `>()` substitution, in source order.  The eval layer
+///   evaluates these recursively.
+///
+/// # Trivial case
+///
+/// When the command is a single simple statement with no substitutions and no
+/// control flow unwrapping, the original command text is returned as-is in a
+/// single segment.  This lets the eval layer's `evaluate_single` fast path
+/// work on the exact input text.
+pub fn parse_with_substitutions(command: &str) -> (ParsedPipeline, Vec<String>) {
+    let tree = parse_tree(command);
+    let root = tree.root_node();
+    let source = command.as_bytes();
+
+    let mut subst_spans = Vec::new();
+    collect_substitutions(root, source, &mut subst_spans);
+
+    let result = walk_ast(root, source);
+
+    // Trivial: one segment spanning the full input, no substitutions, no
+    // control flow unwrapping.  When the walker recurses into a for/if/while
+    // body the segment byte range will be a sub-range of the input, so this
+    // check correctly detects unwrapping.
+    let is_trivial = result.segments.len() <= 1
+        && subst_spans.is_empty()
+        && result
+            .segments
+            .first()
+            .is_none_or(|seg| seg.start == 0 && seg.end >= command.trim_end().len());
+
+    if is_trivial {
+        let redir = result
+            .segments
+            .first()
+            .and_then(|seg| seg.redirection.clone())
+            .or_else(|| detect_redirections(root, source));
         return (
             ParsedPipeline {
                 segments: vec![ShellSegment {
                     command: command.trim().to_string(),
-                    substitutions: vec![],
                     redirection: redir,
                 }],
                 operators: vec![],
@@ -743,105 +779,181 @@ pub fn parse_with_substitutions(command: &str) -> (ParsedPipeline, Vec<String>) 
         );
     }
 
-    let segments = parts
-        .into_iter()
-        .map(|part| {
-            let redir = has_output_redirection(&part);
+    let substitutions: Vec<String> = subst_spans.iter().map(|s| s.inner.clone()).collect();
+
+    let segments: Vec<ShellSegment> = result
+        .segments
+        .iter()
+        .map(|seg| {
+            let text =
+                text_replacing_substitutions(command, seg.start, seg.end, &subst_spans);
             ShellSegment {
-                command: part,
-                substitutions: vec![],
-                redirection: redir,
+                command: text.trim().to_string(),
+                redirection: seg.redirection.clone(),
             }
         })
+        .filter(|s| !s.command.is_empty())
         .collect();
 
     (
         ParsedPipeline {
             segments,
-            operators,
+            operators: result.operators,
         },
         substitutions,
     )
+}
+
+/// Check whether `command` contains output redirection that could mutate
+/// filesystem state.
+///
+/// Parses the command with tree-sitter-bash and inspects `file_redirect` nodes.
+/// See [`check_file_redirect`] for the full safe/flagged policy.
+pub fn has_output_redirection(command: &str) -> Option<Redirection> {
+    let tree = parse_tree(command);
+    detect_redirections(tree.root_node(), command.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // --- Compound splitting ---
+
     #[test]
-    fn split_simple() {
-        let (parts, ops) = split_compound_command("ls -la");
-        assert_eq!(parts, vec!["ls -la"]);
-        assert!(ops.is_empty());
+    fn simple_command() {
+        let (p, subs) = parse_with_substitutions("ls -la");
+        assert_eq!(p.segments.len(), 1);
+        assert_eq!(p.segments[0].command, "ls -la");
+        assert!(p.operators.is_empty());
+        assert!(subs.is_empty());
     }
 
     #[test]
-    fn split_and() {
-        let (parts, ops) = split_compound_command("ls && pwd");
-        assert_eq!(parts, vec!["ls", "pwd"]);
-        assert_eq!(ops, vec![Operator::And]);
+    fn pipe() {
+        let (p, _) = parse_with_substitutions("ls | grep foo");
+        assert_eq!(p.segments.len(), 2);
+        assert_eq!(p.segments[0].command, "ls");
+        assert_eq!(p.segments[1].command, "grep foo");
+        assert_eq!(p.operators, vec![Operator::Pipe]);
     }
 
     #[test]
-    fn split_pipe() {
-        let (parts, ops) = split_compound_command("cat file | grep pat");
-        assert_eq!(parts, vec!["cat file", "grep pat"]);
-        assert_eq!(ops, vec![Operator::Pipe]);
+    fn and_then() {
+        let (p, _) = parse_with_substitutions("mkdir foo && cd foo");
+        assert_eq!(p.segments.len(), 2);
+        assert_eq!(p.segments[0].command, "mkdir foo");
+        assert_eq!(p.segments[1].command, "cd foo");
+        assert_eq!(p.operators, vec![Operator::And]);
     }
 
     #[test]
-    fn split_quoted_operator() {
-        let (parts, ops) = split_compound_command("echo 'a && b'");
-        assert_eq!(parts, vec!["echo 'a && b'"]);
-        assert!(ops.is_empty());
+    fn or_else() {
+        let (p, _) = parse_with_substitutions("test -f x || echo missing");
+        assert_eq!(p.segments.len(), 2);
+        assert_eq!(p.operators, vec![Operator::Or]);
     }
 
     #[test]
-    fn extract_dollar_paren() {
-        let (outer, inners) = extract_substitutions("ls $(which cargo)");
-        assert_eq!(outer, "ls __SUBST__");
-        assert_eq!(inners, vec!["which cargo"]);
+    fn semicolon() {
+        let (p, _) = parse_with_substitutions("echo a; echo b");
+        assert_eq!(p.segments.len(), 2);
+        assert_eq!(p.segments[0].command, "echo a");
+        assert_eq!(p.segments[1].command, "echo b");
     }
 
     #[test]
-    fn extract_backtick() {
-        let (outer, inners) = extract_substitutions("echo `whoami`");
-        assert_eq!(outer, "echo __SUBST__");
-        assert_eq!(inners, vec!["whoami"]);
+    fn triple_and() {
+        let (p, _) = parse_with_substitutions("a && b && c");
+        assert_eq!(p.segments.len(), 3);
+        assert_eq!(p.operators, vec![Operator::And, Operator::And]);
     }
 
     #[test]
-    fn extract_single_quoted_suppressed() {
-        let (_, inners) = extract_substitutions("echo '$(rm -rf /)'");
-        assert!(inners.is_empty());
+    fn mixed_operators() {
+        let (p, _) = parse_with_substitutions("a && b || c");
+        assert_eq!(p.segments.len(), 3);
+        assert_eq!(p.operators, vec![Operator::And, Operator::Or]);
     }
 
     #[test]
-    fn extract_double_quoted_expanded() {
-        let (_, inners) = extract_substitutions("echo \"$(rm -rf /)\"");
-        assert_eq!(inners, vec!["rm -rf /"]);
+    fn quoted_operator_not_split() {
+        let (p, subs) = parse_with_substitutions(r#"echo "a && b""#);
+        assert_eq!(p.segments.len(), 1);
+        assert!(subs.is_empty());
+    }
+
+    // --- Substitution extraction ---
+
+    #[test]
+    fn dollar_paren_substitution() {
+        let (p, subs) = parse_with_substitutions("echo $(date)");
+        assert_eq!(subs, vec!["date"]);
+        assert_eq!(p.segments[0].command, "echo __SUBST__");
     }
 
     #[test]
-    fn extract_process_substitution() {
-        let (outer, inners) = extract_substitutions("diff <(sort a) <(sort b)");
-        assert!(!outer.contains('<'));
-        assert_eq!(inners, vec!["sort a", "sort b"]);
+    fn backtick_substitution() {
+        let (p, subs) = parse_with_substitutions("echo `date`");
+        assert_eq!(subs, vec!["date"]);
+        assert_eq!(p.segments[0].command, "echo __SUBST__");
     }
+
+    #[test]
+    fn single_quoted_not_substituted() {
+        let (_, subs) = parse_with_substitutions("echo '$(date)'");
+        assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn double_quoted_is_substituted() {
+        let (_, subs) = parse_with_substitutions(r#"echo "$(date)""#);
+        assert_eq!(subs, vec!["date"]);
+    }
+
+    #[test]
+    fn process_substitution() {
+        let (_, subs) = parse_with_substitutions("diff <(ls a) <(ls b)");
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0], "ls a");
+        assert_eq!(subs[1], "ls b");
+    }
+
+    // --- Redirection detection ---
 
     #[test]
     fn redir_simple_gt() {
-        assert!(has_output_redirection("ls > file").is_some());
+        assert!(has_output_redirection("echo hi > file").is_some());
     }
 
     #[test]
     fn redir_append() {
-        assert!(has_output_redirection("ls >> file").is_some());
+        assert!(has_output_redirection("echo hi >> file").is_some());
     }
 
     #[test]
     fn redir_ampersand_gt() {
         assert!(has_output_redirection("cmd &> file").is_some());
+    }
+
+    #[test]
+    fn no_redir_devnull() {
+        assert!(has_output_redirection("cmd > /dev/null").is_none());
+    }
+
+    #[test]
+    fn no_redir_devnull_stderr() {
+        assert!(has_output_redirection("cmd 2>/dev/null").is_none());
+    }
+
+    #[test]
+    fn no_redir_devnull_append() {
+        assert!(has_output_redirection("cmd >> /dev/null").is_none());
+    }
+
+    #[test]
+    fn no_redir_devnull_ampersand() {
+        assert!(has_output_redirection("cmd &>/dev/null").is_none());
     }
 
     #[test]
@@ -851,286 +963,53 @@ mod tests {
 
     #[test]
     fn no_redir_fd_dup_stdout_to_stderr() {
-        assert!(has_output_redirection("cmd 1>&2").is_none());
-    }
-
-    #[test]
-    fn no_redir_fd_close() {
-        assert!(has_output_redirection("cmd 2>&-").is_none());
-    }
-
-    #[test]
-    fn no_redir_bare_dup_to_stderr() {
         assert!(has_output_redirection("cmd >&2").is_none());
     }
 
     #[test]
-    fn no_redir_bare_close() {
+    fn no_redir_fd_close() {
         assert!(has_output_redirection("cmd >&-").is_none());
     }
 
     #[test]
-    fn no_redir_process_subst() {
-        assert!(has_output_redirection("diff >(sort)").is_none());
+    fn redir_custom_fd_target() {
+        let r = has_output_redirection("cmd >&3");
+        assert!(r.is_some());
+        assert!(r.unwrap().description.contains("custom fd target"));
     }
 
     #[test]
     fn no_redir_quoted() {
-        assert!(has_output_redirection("echo 'hello > world'").is_none());
-    }
-
-    // ── /dev/null is non-mutating ──
-
-    #[test]
-    fn no_redir_devnull() {
-        assert!(has_output_redirection("cmd > /dev/null").is_none());
+        assert!(has_output_redirection(r#"echo ">""#).is_none());
     }
 
     #[test]
-    fn no_redir_devnull_append() {
-        assert!(has_output_redirection("cmd >> /dev/null").is_none());
+    fn no_redir_process_subst() {
+        assert!(has_output_redirection("diff <(ls) >(cat)").is_none());
+    }
+
+    // --- Control flow ---
+
+    #[test]
+    fn for_loop_extracts_body() {
+        let (p, _) = parse_with_substitutions("for i in *; do echo \"$i\"; done");
+        assert!(p.segments.iter().all(|s| !s.command.starts_with("for")));
+        assert!(p.segments.iter().any(|s| s.command.contains("echo")));
     }
 
     #[test]
-    fn no_redir_devnull_stderr() {
-        assert!(has_output_redirection("cmd 2> /dev/null").is_none());
+    fn if_statement_extracts_body() {
+        let (p, _) = parse_with_substitutions("if test -f x; then echo yes; fi");
+        assert!(p.segments.iter().all(|s| !s.command.starts_with("if")));
+        assert!(p.segments.iter().any(|s| s.command.contains("test")));
+        assert!(p.segments.iter().any(|s| s.command.contains("echo")));
     }
 
     #[test]
-    fn no_redir_devnull_ampersand() {
-        assert!(has_output_redirection("cmd &> /dev/null").is_none());
-    }
-
-    #[test]
-    fn redir_devnull_plus_file() {
-        // /dev/null for stderr is fine, but > file is still mutation
-        assert!(has_output_redirection("cmd > /tmp/out 2> /dev/null").is_some());
-    }
-
-    // ── Custom fd targets are suspicious ──
-
-    #[test]
-    fn redir_custom_fd_dup_target() {
-        // >&3 could be writing to a file if fd 3 was opened earlier
-        assert!(has_output_redirection("cmd >&3").is_some());
-    }
-
-    #[test]
-    fn redir_custom_fd_dup_numbered() {
-        // 2>&3 — fd 3 could be a file
-        assert!(has_output_redirection("cmd 2>&3").is_some());
-    }
-
-    #[test]
-    fn no_redir_standard_fd_dup() {
-        // >&1 is always safe (stdout to stdout)
-        assert!(has_output_redirection("cmd >&1").is_none());
-    }
-
-    // ── Heredoc parsing ──
-
-    #[test]
-    fn heredoc_skip_helper_basic() {
-        let input: Vec<char> = "<<'EOF'\nbody\nEOF\n".chars().collect();
-        let span = skip_heredoc(&input, 0).unwrap();
-        assert!(span.is_quoted);
-        assert_eq!(span.body_end, input.len());
-    }
-
-    #[test]
-    fn heredoc_skip_helper_unquoted() {
-        let input: Vec<char> = "<<EOF\nbody\nEOF\n".chars().collect();
-        let span = skip_heredoc(&input, 0).unwrap();
-        assert!(!span.is_quoted);
-        assert_eq!(span.body_end, input.len());
-    }
-
-    #[test]
-    fn heredoc_skip_helper_double_quoted() {
-        let input: Vec<char> = "<<\"EOF\"\nbody\nEOF\n".chars().collect();
-        let span = skip_heredoc(&input, 0).unwrap();
-        assert!(span.is_quoted);
-        assert_eq!(span.body_end, input.len());
-    }
-
-    #[test]
-    fn heredoc_skip_rejects_here_string() {
-        let input: Vec<char> = "<<<word".chars().collect();
-        assert!(skip_heredoc(&input, 0).is_none());
-    }
-
-    #[test]
-    fn heredoc_quoted_no_backtick_substitutions() {
-        // Backticks inside a quoted heredoc body should NOT be extracted
-        let cmd = "cat <<'EOF'\nline with `backticks` here\nEOF\n";
-        let (_, inners) = extract_substitutions(cmd);
-        assert!(inners.is_empty(), "quoted heredoc body should suppress backtick extraction");
-    }
-
-    #[test]
-    fn heredoc_quoted_no_dollar_substitutions() {
-        // $() inside a quoted heredoc body should NOT be extracted
-        let cmd = "cat <<'EOF'\nline with $(command) here\nEOF\n";
-        let (_, inners) = extract_substitutions(cmd);
-        assert!(inners.is_empty(), "quoted heredoc body should suppress $() extraction");
-    }
-
-    #[test]
-    fn heredoc_unquoted_extracts_substitutions() {
-        // Backticks inside an unquoted heredoc body ARE expanded
-        let cmd = "cat <<EOF\n`whoami`\nEOF\n";
-        let (_, inners) = extract_substitutions(cmd);
-        assert_eq!(inners, vec!["whoami"]);
-    }
-
-    #[test]
-    fn heredoc_no_false_compound_split() {
-        // Operators inside heredoc body should NOT split the command
-        let cmd = "cat <<'EOF'\nline && other ; stuff\nEOF\n";
-        let (parts, ops) = split_compound_command(cmd);
-        assert_eq!(parts.len(), 1, "heredoc body operators should not split: {parts:?}");
-        assert!(ops.is_empty());
-    }
-
-    #[test]
-    fn heredoc_markdown_backticks_not_substitutions() {
-        // The exact pattern that triggered the original bug:
-        // markdown inline code with backticks inside a quoted heredoc
-        let cmd = "cat <<'EOF'\n## Changes\n- **New:** `config.rs` — Config struct\n- **New:** `eval/mod.rs` — rewritten\nEOF\n";
-        let (_, inners) = extract_substitutions(cmd);
-        assert!(inners.is_empty(), "markdown backticks in heredoc should not be substitutions");
-    }
-
-    #[test]
-    fn heredoc_no_false_redirection() {
-        // > inside heredoc body should NOT be detected as output redirection
-        let cmd = "cat <<'EOF'\nCo-Authored-By: Name <noreply@anthropic.com>\nEOF\n";
-        assert!(has_output_redirection(cmd).is_none(), "heredoc body > should not trigger redirection");
-    }
-
-    #[test]
-    fn heredoc_unquoted_no_false_redirection() {
-        // Even unquoted heredocs: > in body is not output redirection
-        let cmd = "cat <<EOF\nsome text > with angle brackets\nEOF\n";
-        assert!(has_output_redirection(cmd).is_none(), "unquoted heredoc body > should not trigger redirection");
-    }
-
-    #[test]
-    fn heredoc_redir_before_heredoc_detected() {
-        // Actual redirection BEFORE the heredoc should still be caught
-        let cmd = "cat > /tmp/out <<'EOF'\nbody\nEOF\n";
-        assert!(has_output_redirection(cmd).is_some(), "redirection before heredoc should be detected");
-    }
-
-    #[test]
-    fn heredoc_in_dollar_subst() {
-        // Heredoc wrapped in $() — the common Claude Code pattern
-        let cmd = "gh pr create --body \"$(cat <<'EOF'\n## Summary\nCode with `backticks` and $(stuff)\nEOF\n)\"";
-        let (_, inners) = extract_substitutions(cmd);
-        // Only the outer $() should be extracted, containing the cat heredoc
-        assert_eq!(inners.len(), 1, "should extract one $() substitution");
-        assert!(inners[0].starts_with("cat <<'EOF'"));
-        // Now recursively parse the inner — should find NO further substitutions
-        let (_, inner_subs) = extract_substitutions(&inners[0]);
-        assert!(inner_subs.is_empty(), "heredoc body should not yield substitutions on recursive parse");
-    }
-
-    // ── Heredoc + pipe splitting (the pipe-swallowing bug) ──
-
-    #[test]
-    fn heredoc_pipe_splits_correctly() {
-        // The exact pattern that bypassed the gate:
-        // `cat <<'EOF' | kubectl apply -f -` should split into TWO segments
-        let cmd = "cat <<'EOF' | kubectl apply -f -\napiVersion: v1\nkind: Role\nEOF\n";
-        let (parts, ops) = split_compound_command(cmd);
-        assert_eq!(parts.len(), 2, "heredoc pipe should split into 2 parts: {parts:?}");
-        assert_eq!(ops, vec![Operator::Pipe]);
-        assert!(parts[0].starts_with("cat <<'EOF'"), "first part should be cat heredoc: {}", parts[0]);
-        assert_eq!(parts[1].trim(), "kubectl apply -f -", "second part should be kubectl: {}", parts[1]);
-    }
-
-    #[test]
-    fn heredoc_pipe_unquoted_splits_correctly() {
-        let cmd = "cat <<EOF | grep pattern\nbody line\nEOF\n";
-        let (parts, ops) = split_compound_command(cmd);
-        assert_eq!(parts.len(), 2, "unquoted heredoc pipe should split: {parts:?}");
-        assert_eq!(ops, vec![Operator::Pipe]);
-        assert_eq!(parts[1].trim(), "grep pattern");
-    }
-
-    #[test]
-    fn heredoc_and_splits_correctly() {
-        // && on same line as heredoc
-        let cmd = "cat <<'EOF' && echo done\nbody\nEOF\n";
-        let (parts, ops) = split_compound_command(cmd);
-        assert_eq!(parts.len(), 2, "heredoc && should split: {parts:?}");
-        assert_eq!(ops, vec![Operator::And]);
-        assert_eq!(parts[1].trim(), "echo done");
-    }
-
-    #[test]
-    fn heredoc_semicolon_splits_correctly() {
-        let cmd = "cat <<'EOF' ; rm -rf /\nbody\nEOF\n";
-        let (parts, ops) = split_compound_command(cmd);
-        assert_eq!(parts.len(), 2, "heredoc ; should split: {parts:?}");
-        assert_eq!(ops, vec![Operator::Semi]);
-        assert_eq!(parts[1].trim(), "rm -rf /");
-    }
-
-    #[test]
-    fn heredoc_pipe_err_splits_correctly() {
-        let cmd = "cat <<'EOF' |& grep error\nbody\nEOF\n";
-        let (parts, ops) = split_compound_command(cmd);
-        assert_eq!(parts.len(), 2, "heredoc |& should split: {parts:?}");
-        assert_eq!(ops, vec![Operator::PipeErr]);
-        assert_eq!(parts[1].trim(), "grep error");
-    }
-
-    #[test]
-    fn heredoc_or_splits_correctly() {
-        let cmd = "cat <<'EOF' || echo fallback\nbody\nEOF\n";
-        let (parts, ops) = split_compound_command(cmd);
-        assert_eq!(parts.len(), 2, "heredoc || should split: {parts:?}");
-        assert_eq!(ops, vec![Operator::Or]);
-        assert_eq!(parts[1].trim(), "echo fallback");
-    }
-
-    #[test]
-    fn heredoc_redir_on_delim_line_detected() {
-        // `cat <<'EOF' > /tmp/out` — the > is on the DELIM line, should be detected
-        let cmd = "cat <<'EOF' > /tmp/out\nbody\nEOF\n";
-        assert!(has_output_redirection(cmd).is_some(),
-            "redirection on heredoc DELIM line should be detected");
-    }
-
-    #[test]
-    fn heredoc_skip_after_delim_position() {
-        // Verify after_delim points right after the delimiter word
-        let input: Vec<char> = "<<'EOF' | kubectl apply -f -\nbody\nEOF\n".chars().collect();
-        let span = skip_heredoc(&input, 0).unwrap();
-        assert!(span.is_quoted);
-        // after_delim should be right after 'EOF' — before the space-pipe-space
-        let rest: String = input[span.after_delim..].iter().collect();
-        assert!(rest.starts_with(" | kubectl"), "rest of line after delim: {rest}");
-        assert_eq!(span.body_end, input.len());
-    }
-
-    #[test]
-    fn heredoc_body_operators_still_ignored() {
-        // Operators inside the heredoc body should NOT cause splits
-        let cmd = "cat <<'EOF'\nline && other | stuff ; more\nEOF\n";
-        let (parts, ops) = split_compound_command(cmd);
-        assert_eq!(parts.len(), 1, "body operators should not split: {parts:?}");
-        assert!(ops.is_empty());
-    }
-
-    #[test]
-    fn heredoc_pipe_substitutions_on_right_side() {
-        // $() on the right side of a heredoc pipe should be extracted
-        let cmd = "cat <<'EOF' | kubectl apply -f $(echo -)\nbody\nEOF\n";
-        let (outer, subs) = extract_substitutions(cmd);
-        assert_eq!(subs, vec!["echo -"], "substitution on pipe RHS should be extracted: {subs:?}");
-        // The outer should still contain the pipe
-        assert!(outer.contains('|'), "outer should contain pipe: {outer}");
+    fn while_loop_extracts_body() {
+        let (p, _) = parse_with_substitutions("while true; do sleep 1; done");
+        assert!(p.segments.iter().all(|s| !s.command.starts_with("while")));
+        assert!(p.segments.iter().any(|s| s.command.contains("true")));
+        assert!(p.segments.iter().any(|s| s.command.contains("sleep")));
     }
 }
