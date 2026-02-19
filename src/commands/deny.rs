@@ -1,7 +1,12 @@
+//! Unconditional deny spec for destructive commands.
+
 use crate::commands::CommandSpec;
 use crate::eval::{CommandContext, Decision, RuleMatch};
 
 /// A command spec that unconditionally denies execution.
+///
+/// Used for commands like `shred`, `dd`, `mkfs`, `shutdown` — commands that
+/// should never be run by an AI agent regardless of context.
 pub struct DenyCommandSpec;
 
 impl CommandSpec for DenyCommandSpec {

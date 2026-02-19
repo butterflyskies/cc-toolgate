@@ -65,6 +65,8 @@ pub struct Redirection {
 /// For `a && b | c`, there are three segments and two operators (`&&`, `|`).
 #[derive(Debug, Clone)]
 pub struct ParsedPipeline {
+    /// The command segments (one per simple command in the pipeline/list).
     pub segments: Vec<ShellSegment>,
+    /// Operators between consecutive segments (`&&`, `||`, `;`, `|`, `|&`).
     pub operators: Vec<Operator>,
 }

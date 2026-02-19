@@ -1,15 +1,33 @@
+//! Subcommand-aware GitHub CLI (gh) evaluation.
+//!
+//! gh uses two-word subcommands (`pr list`, `issue create`), so both the
+//! two-word form and one-word fallback are checked against the config lists.
+//! Supports env-gated auto-allow and redirection escalation.
+
 use crate::commands::CommandSpec;
 use crate::config::GhConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
 
+/// Subcommand-aware gh CLI evaluator.
+///
+/// Evaluation order:
+/// 1. Read-only subcommands → ALLOW (with redirection escalation)
+/// 2. Env-gated subcommands → ALLOW if env var present, else ASK
+/// 3. Known mutating subcommands → ASK
+/// 4. Everything else → ASK
 pub struct GhSpec {
+    /// Read-only subcommands (e.g. `pr list`, `pr view`, `status`).
     read_only: Vec<String>,
+    /// Known mutating subcommands (e.g. `pr create`, `repo delete`).
     mutating: Vec<String>,
+    /// Subcommands allowed only when `config_env_var` is present.
     allowed_with_config: Vec<String>,
+    /// Env var name that gates `allowed_with_config` subcommands.
     config_env_var: String,
 }
 
 impl GhSpec {
+    /// Build a gh spec from configuration.
     pub fn from_config(config: &GhConfig) -> Self {
         Self {
             read_only: config.read_only.clone(),

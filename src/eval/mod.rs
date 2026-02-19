@@ -1,4 +1,13 @@
+//! Evaluation engine: builds a command registry from config and evaluates commands.
+//!
+//! The [`CommandRegistry`](crate::eval::CommandRegistry) is the central evaluation structure. It maps command
+//! names to [`CommandSpec`](crate::commands::CommandSpec) implementations and
+//! handles compound command decomposition, substitution evaluation, wrapper
+//! command unwrapping, and decision aggregation.
+
+/// Per-segment evaluation context (base command, args, env vars, redirections).
 pub mod context;
+/// Decision enum and rule match types.
 pub mod decision;
 
 pub use context::CommandContext;
@@ -11,11 +20,18 @@ use crate::config::Config;
 use crate::parse;
 
 /// Registry of all command specs, keyed by command name.
+///
+/// Built from [`Config`] via [`from_config`](Self::from_config).
+/// Handles single-command evaluation, compound command decomposition,
+/// wrapper command unwrapping, substitution evaluation, and decision aggregation.
 pub struct CommandRegistry {
+    /// Command name → evaluation spec (git, cargo, kubectl, gh, simple, deny).
     specs: HashMap<String, Box<dyn CommandSpec>>,
-    /// Wrapper commands: name → floor decision.
-    /// These execute their arguments as subcommands (e.g. xargs, sudo, env).
+    /// Wrapper commands (e.g. `xargs`, `sudo`, `env`) → floor decision.
+    /// These execute their arguments as subcommands and are handled
+    /// separately from regular specs.
     wrappers: HashMap<String, Decision>,
+    /// When true, DENY decisions are escalated to ASK.
     escalate_deny: bool,
 }
 

@@ -1,3 +1,5 @@
+//! Per-segment command context: tokenization, env var extraction, and redirection detection.
+
 use crate::parse::Redirection;
 
 /// Context for evaluating a single command segment.

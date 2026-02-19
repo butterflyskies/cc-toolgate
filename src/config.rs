@@ -1,40 +1,68 @@
+//! Configuration loading and overlay merge logic.
+//!
+//! cc-toolgate ships with sensible defaults embedded in the binary via
+//! `config.default.toml`. Users can override any part by placing a
+//! `config.toml` at `~/.config/cc-toolgate/config.toml`. The user config
+//! **merges** with defaults: lists extend (deduplicated), scalars override,
+//! `remove_<field>` subtracts, and `replace = true` replaces entirely.
+
 use serde::{Deserialize, Serialize};
 
-/// Embedded default configuration.
+/// Embedded default configuration (compiled into the binary from `config.default.toml`).
 const DEFAULT_CONFIG: &str = include_str!("../config.default.toml");
 
 // ── Final (merged) config types ──
 
+/// Top-level configuration, produced by merging embedded defaults with
+/// an optional user overlay from `~/.config/cc-toolgate/config.toml`.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
+    /// Global settings (e.g. escalate_deny).
     #[serde(default)]
     pub settings: Settings,
+    /// Flat command-to-decision mappings (allow, ask, deny lists).
     #[serde(default)]
     pub commands: Commands,
+    /// Wrapper commands that execute their arguments as subcommands.
     #[serde(default)]
     pub wrappers: WrapperConfig,
+    /// Git subcommand-aware evaluation rules.
     #[serde(default)]
     pub git: GitConfig,
+    /// Cargo subcommand-aware evaluation rules.
     #[serde(default)]
     pub cargo: CargoConfig,
+    /// kubectl subcommand-aware evaluation rules.
     #[serde(default)]
     pub kubectl: KubectlConfig,
+    /// GitHub CLI (gh) subcommand-aware evaluation rules.
     #[serde(default)]
     pub gh: GhConfig,
 }
 
+/// Global settings that affect evaluation behavior.
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Settings {
+    /// When true, DENY decisions are escalated to ASK (the user is prompted
+    /// instead of being blocked). Useful for operators who want visibility
+    /// without hard blocks.
     #[serde(default)]
     pub escalate_deny: bool,
 }
 
+/// Flat command name → decision mappings for simple commands.
+///
+/// Commands in `allow` run silently, `ask` prompts the user, `deny` blocks outright.
+/// Unrecognized commands default to ASK.
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Commands {
+    /// Commands that run silently (e.g. `ls`, `cat`, `grep`).
     #[serde(default)]
     pub allow: Vec<String>,
+    /// Commands that require user confirmation (e.g. `rm`, `curl`, `pip`).
     #[serde(default)]
     pub ask: Vec<String>,
+    /// Commands that are blocked outright (e.g. `shred`, `dd`, `mkfs`).
     #[serde(default)]
     pub deny: Vec<String>,
 }
@@ -54,56 +82,83 @@ pub struct WrapperConfig {
     pub ask_floor: Vec<String>,
 }
 
+/// Git subcommand evaluation rules.
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct GitConfig {
+    /// Subcommands that are always allowed (e.g. `status`, `log`, `diff`, `branch`).
     #[serde(default)]
     pub read_only: Vec<String>,
+    /// Subcommands that are allowed only when `config_env_var` is set in the command's
+    /// environment (e.g. `push`, `pull` when `GIT_CONFIG_GLOBAL` is present).
     #[serde(default)]
     pub allowed_with_config: Vec<String>,
     /// Env var that must be set for `allowed_with_config` commands to auto-allow.
-    /// When empty, those commands fall through to ASK.
+    /// When empty, the env-gating feature is disabled and those commands always ASK.
     #[serde(default)]
     pub config_env_var: String,
+    /// Flags that indicate a force-push (e.g. `--force`, `-f`, `--force-with-lease`).
+    /// Force-pushes always require confirmation regardless of env-gating.
     #[serde(default)]
     pub force_push_flags: Vec<String>,
 }
 
+/// Cargo subcommand evaluation rules.
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct CargoConfig {
+    /// Subcommands that are always allowed (e.g. `build`, `test`, `check`, `clippy`).
     #[serde(default)]
     pub safe_subcommands: Vec<String>,
+    /// Subcommands allowed only when `config_env_var` is set.
     #[serde(default)]
     pub allowed_with_config: Vec<String>,
+    /// Env var that gates `allowed_with_config` subcommands.
     #[serde(default)]
     pub config_env_var: String,
 }
 
+/// kubectl subcommand evaluation rules.
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct KubectlConfig {
+    /// Read-only subcommands that are always allowed (e.g. `get`, `describe`, `logs`).
     #[serde(default)]
     pub read_only: Vec<String>,
+    /// Known mutating subcommands that always require confirmation (e.g. `apply`, `delete`).
     #[serde(default)]
     pub mutating: Vec<String>,
+    /// Subcommands allowed only when `config_env_var` is set.
     #[serde(default)]
     pub allowed_with_config: Vec<String>,
+    /// Env var that gates `allowed_with_config` subcommands.
     #[serde(default)]
     pub config_env_var: String,
 }
 
+/// GitHub CLI (gh) subcommand evaluation rules.
+///
+/// gh uses two-word subcommands (e.g. `pr list`, `issue create`), so
+/// both two-word and one-word matches are checked.
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct GhConfig {
+    /// Read-only subcommands (e.g. `pr list`, `pr view`, `status`, `api`).
     #[serde(default)]
     pub read_only: Vec<String>,
+    /// Known mutating subcommands (e.g. `pr create`, `pr merge`, `repo delete`).
     #[serde(default)]
     pub mutating: Vec<String>,
+    /// Subcommands allowed only when `config_env_var` is set.
     #[serde(default)]
     pub allowed_with_config: Vec<String>,
+    /// Env var that gates `allowed_with_config` subcommands.
     #[serde(default)]
     pub config_env_var: String,
 }
 
 // ── Overlay types (user config that merges with defaults) ──
+//
+// These mirror the public config types but use `Option` for scalars and
+// include `replace` flags and `remove_*` lists for the merge system.
 
+/// User-provided configuration overlay, deserialized from `~/.config/cc-toolgate/config.toml`.
 #[derive(Debug, Deserialize, Default)]
 struct ConfigOverlay {
     #[serde(default)]

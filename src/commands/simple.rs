@@ -1,15 +1,20 @@
+//! Data-driven command spec for flat allow/ask/deny command lists.
+
 use crate::commands::CommandSpec;
 use crate::eval::{CommandContext, Decision, RuleMatch};
 
 /// A data-driven command spec for flat allow/ask commands.
 ///
 /// For allow commands: returns Allow unless output redirection is detected (→ Ask).
+/// `--version` on any allowed command is also allowed.
 /// For ask commands: always returns Ask.
 pub struct SimpleCommandSpec {
+    /// The baseline decision for this command (Allow, Ask, or Deny).
     decision: Decision,
 }
 
 impl SimpleCommandSpec {
+    /// Create a new spec with the given baseline decision.
     pub fn new(decision: Decision) -> Self {
         Self { decision }
     }

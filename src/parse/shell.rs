@@ -835,7 +835,7 @@ pub fn parse_with_substitutions(command: &str) -> (ParsedPipeline, Vec<String>) 
 /// filesystem state.
 ///
 /// Parses the command with tree-sitter-bash and inspects `file_redirect` nodes.
-/// See [`check_file_redirect`] for the full safe/flagged policy.
+/// See `check_file_redirect` for the full safe/flagged policy.
 pub fn has_output_redirection(command: &str) -> Option<Redirection> {
     let tree = parse_tree(command);
     detect_redirections(tree.root_node(), command.as_bytes())
