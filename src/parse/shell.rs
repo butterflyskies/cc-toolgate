@@ -330,7 +330,8 @@ fn walk_ast(node: Node, source: &[u8]) -> WalkResult {
         "if_statement" => walk_if(node, source),
         "case_statement" => walk_case(node, source),
         "subshell" | "compound_statement" | "do_group" | "else_clause" | "elif_clause"
-        | "case_item" => walk_block(node, source),
+        => walk_block(node, source),
+        "case_item" => walk_case_item(node, source),
         "negated_command" => walk_negated(node, source),
         "function_definition" => walk_function(node, source),
         "variable_assignment" => WalkResult::single(node.start_byte(), node.end_byte(), None),
@@ -639,13 +640,36 @@ fn walk_if(node: Node, source: &[u8]) -> WalkResult {
     result
 }
 
-/// `case_statement`: recurse into each `case_item`.
+/// `case_statement`: recurse into each `case_item`, extracting only the body
+/// commands (after the `)` delimiter), not the pattern labels before it.
 fn walk_case(node: Node, source: &[u8]) -> WalkResult {
     let mut result = WalkResult::empty();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "case_item" {
-            result.append(walk_block(child, source), Some(Operator::Semi));
+            result.append(walk_case_item(child, source), Some(Operator::Semi));
+        }
+    }
+    result
+}
+
+/// Walk a `case_item` node, skipping pattern labels and extracting only the
+/// body commands.
+///
+/// In tree-sitter-bash, `case_item` children before the `)` token are pattern
+/// labels (e.g. `rm`, `*.txt`).  Children after `)` are the body commands to
+/// execute when matched.  Only the body commands are evaluable.
+fn walk_case_item(node: Node, source: &[u8]) -> WalkResult {
+    let mut result = WalkResult::empty();
+    let mut past_paren = false;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() && child.kind() == ")" {
+            past_paren = true;
+            continue;
+        }
+        if past_paren && child.is_named() {
+            result.append(walk_ast(child, source), Some(Operator::Semi));
         }
     }
     result
@@ -1011,5 +1035,31 @@ mod tests {
         assert!(p.segments.iter().all(|s| !s.command.starts_with("while")));
         assert!(p.segments.iter().any(|s| s.command.contains("true")));
         assert!(p.segments.iter().any(|s| s.command.contains("sleep")));
+    }
+
+    #[test]
+    fn case_pattern_not_treated_as_command() {
+        let (p, _) = parse_with_substitutions(
+            r#"case $x in rm) echo hi ;; kubectl) echo bye ;; esac"#,
+        );
+        let commands: Vec<&str> = p.segments.iter().map(|s| s.command.as_str()).collect();
+        // Pattern labels (rm, kubectl) must NOT appear as segments.
+        // Only the body commands (echo hi, echo bye) should.
+        assert!(
+            !p.segments.iter().any(|s| s.command.trim() == "rm"),
+            "case pattern 'rm' leaked as segment: {commands:?}",
+        );
+        assert!(
+            !p.segments.iter().any(|s| s.command.trim() == "kubectl"),
+            "case pattern 'kubectl' leaked as segment: {commands:?}",
+        );
+        assert!(
+            p.segments.iter().any(|s| s.command.contains("echo hi")),
+            "expected 'echo hi' body: {commands:?}",
+        );
+        assert!(
+            p.segments.iter().any(|s| s.command.contains("echo bye")),
+            "expected 'echo bye' body: {commands:?}",
+        );
     }
 }
