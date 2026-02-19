@@ -446,11 +446,25 @@ fn walk_redirected(node: Node, source: &[u8]) -> WalkResult {
                     if matches!(sib.kind(), "file_redirect" | "herestring_redirect") {
                         continue;
                     }
-                    let end = effective_end(node).min(child.start_byte());
-                    full.append(
-                        WalkResult::single(sib.start_byte(), end, redir.clone()),
-                        None,
-                    );
+                    if is_leaf_command(sib) {
+                        let end = effective_end(node).min(child.start_byte());
+                        full.append(
+                            WalkResult::single(sib.start_byte(), end, redir.clone()),
+                            None,
+                        );
+                    } else {
+                        // Compound body (for/while/if/case): recurse to
+                        // extract inner commands instead of flattening.
+                        let mut body = walk_ast(sib, source);
+                        if let Some(ref r) = redir {
+                            for seg in &mut body.segments {
+                                if seg.redirection.is_none() {
+                                    seg.redirection = Some(r.clone());
+                                }
+                            }
+                        }
+                        full.append(body, None);
+                    }
                     break;
                 }
                 // The first operator token in heredoc_redirect determines how
@@ -1062,6 +1076,31 @@ mod tests {
         assert!(
             p.segments.iter().any(|s| s.command.contains("echo bye")),
             "expected 'echo bye' body: {commands:?}",
+        );
+    }
+
+    #[test]
+    fn compound_heredoc_pipe_unwraps_body() {
+        // When a compound command (while/for/if) is the body of a
+        // redirected_statement with a heredoc pipe, the body must be
+        // recursively walked so inner commands are extracted — not
+        // flattened as "while ..." text.
+        let cmd = "while true; do shred /dev/sda; done <<EOF | cat\nstuff\nEOF";
+        let (p, _) = parse_with_substitutions(cmd);
+        let commands: Vec<&str> = p.segments.iter().map(|s| s.command.as_str()).collect();
+        // The while-loop body should be unwrapped to "shred /dev/sda",
+        // not left as "while true; do shred /dev/sda; done".
+        assert!(
+            !p.segments.iter().any(|s| s.command.starts_with("while")),
+            "while-loop was not unwrapped in heredoc pipe path: {commands:?}",
+        );
+        assert!(
+            p.segments.iter().any(|s| s.command.contains("shred")),
+            "expected 'shred' to be extracted from loop body: {commands:?}",
+        );
+        assert!(
+            p.segments.iter().any(|s| s.command.trim() == "cat"),
+            "expected piped 'cat' segment: {commands:?}",
         );
     }
 }

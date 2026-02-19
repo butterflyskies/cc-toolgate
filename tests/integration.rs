@@ -346,6 +346,16 @@ decision_test!(
 );
 decision_test!(if_body_allows, "if true; then ls; fi", Allow);
 decision_test!(if_body_rm_asks, "if true; then rm foo; fi", Ask);
+decision_test!(
+    while_heredoc_pipe_shred_denies,
+    "while true; do shred /dev/sda; done <<EOF | cat\nstuff\nEOF",
+    Deny
+);
+decision_test!(
+    for_heredoc_pipe_ls_allows,
+    "for f in *; do ls \"$f\"; done <<EOF | grep foo\ndata\nEOF",
+    Allow
+);
 
 // ── Wrapper commands ──
 
