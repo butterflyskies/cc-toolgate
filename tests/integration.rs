@@ -599,3 +599,27 @@ fn heredoc_only_no_pipe_cat_allowed() {
         "cat with heredoc and no pipe should be allowed"
     );
 }
+
+#[test]
+fn heredoc_unquoted_subst_shred_denies() {
+    // Unquoted heredoc: bash expands $() at runtime, so the substitution
+    // must be extracted and evaluated. shred → DENY.
+    let cmd = "cat <<EOF\n$(shred /dev/sda)\nEOF";
+    assert_eq!(
+        decision_for(cmd),
+        Decision::Deny,
+        "unquoted heredoc with $(shred) must deny"
+    );
+}
+
+#[test]
+fn heredoc_quoted_subst_not_expanded() {
+    // Quoted heredoc: bash does NOT expand $(), so there's no substitution
+    // to evaluate. cat alone → ALLOW.
+    let cmd = "cat <<'EOF'\n$(shred /dev/sda)\nEOF";
+    assert_eq!(
+        decision_for(cmd),
+        Decision::Allow,
+        "quoted heredoc suppresses expansion, cat alone is allowed"
+    );
+}
