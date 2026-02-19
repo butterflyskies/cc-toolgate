@@ -1,6 +1,6 @@
 [package]
 name = "cc-toolgate"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "PreToolUse hook for Claude Code that gates Bash commands with compound-command-aware validation"
 license = "MIT"
