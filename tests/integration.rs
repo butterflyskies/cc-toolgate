@@ -210,6 +210,8 @@ decision_test!(redir_combined, "bat file &> /tmp/out", Ask);
 decision_test!(redir_cargo_build, "cargo build --release > /tmp/log", Ask);
 decision_test!(redir_git_log, "git log > /tmp/log.txt", Ask);
 decision_test!(redir_gh_pr_list, "gh pr list > /tmp/prs.txt", Ask);
+decision_test!(redir_clobber, "echo hi >| file.txt", Ask);
+decision_test!(redir_read_write_asks, "cat <> file.txt", Ask);
 
 // ── /dev/null redirection (non-mutating) ──
 

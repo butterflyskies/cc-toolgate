@@ -150,7 +150,8 @@ fn text_replacing_substitutions(
 ///
 /// # Flagged patterns (returns `Some`)
 ///
-/// - `>`, `>>` to any path other than `/dev/null`
+/// - `>`, `>>`, `>|` to any path other than `/dev/null`
+/// - `<>` (read-write open, detected via ERROR node in tree-sitter AST)
 /// - `&>`, `&>>` to any path other than `/dev/null`
 /// - `>&N` or `M>&N` where N ≥ 3 (custom fd target)
 /// - `N>` or `N>>` to any path other than `/dev/null`
@@ -169,7 +170,7 @@ fn check_file_redirect(node: Node, source: &[u8]) -> Option<Redirection> {
             let k = child.kind();
             if matches!(
                 k,
-                ">" | ">>" | "&>" | "&>>" | ">&" | "<" | "<<<" | "<<" | "<&"
+                ">" | ">>" | ">|" | "&>" | "&>>" | ">&" | "<" | "<<<" | "<<" | "<&"
             ) {
                 operator = k;
             }
@@ -177,6 +178,16 @@ fn check_file_redirect(node: Node, source: &[u8]) -> Option<Redirection> {
     }
 
     if matches!(operator, "" | "<" | "<<<" | "<<" | "<&") {
+        // tree-sitter-bash parses `<>` (read-write) as `<` + ERROR(`>`).
+        // Detect this by checking the node's raw text for the `<>` sequence.
+        if operator == "<" {
+            let text = node.utf8_text(source).unwrap_or("");
+            if text.contains("<>") {
+                return Some(Redirection {
+                    description: "output redirection (<> read-write)".into(),
+                });
+            }
+        }
         return None;
     }
 
@@ -209,7 +220,7 @@ fn check_file_redirect(node: Node, source: &[u8]) -> Option<Redirection> {
         });
     }
 
-    if matches!(operator, ">" | ">>") {
+    if matches!(operator, ">" | ">>" | ">|") {
         if dest == "/dev/null" {
             return None;
         }
@@ -1027,6 +1038,27 @@ mod tests {
     #[test]
     fn no_redir_process_subst() {
         assert!(has_output_redirection("diff <(ls) >(cat)").is_none());
+    }
+
+    #[test]
+    fn redir_clobber() {
+        let r = has_output_redirection("echo hi >| file.txt");
+        assert!(r.is_some(), "expected >| to be flagged as output redirection");
+        assert!(r.unwrap().description.contains(">|"));
+    }
+
+    #[test]
+    fn redir_clobber_devnull() {
+        assert!(has_output_redirection("echo hi >| /dev/null").is_none());
+    }
+
+    #[test]
+    fn redir_read_write_detected() {
+        // tree-sitter-bash parses `<>` as `<` + ERROR(`>`). We detect the
+        // ERROR child and flag it as output redirection.
+        let r = has_output_redirection("cat <> file.txt");
+        assert!(r.is_some(), "expected <> to be flagged as output redirection");
+        assert!(r.unwrap().description.contains("<>"));
     }
 
     // --- Control flow ---
