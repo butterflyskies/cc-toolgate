@@ -20,7 +20,14 @@ src/
     mod.rs          CommandRegistry, strictest-wins aggregation
     context.rs      CommandContext struct
     decision.rs     Decision enum, RuleMatch
-  commands/         CommandSpec implementations (simple, deny, git, cargo, kubectl, gh)
+  commands/
+    mod.rs          CommandSpec trait
+    simple.rs       SimpleCommandSpec (flat allow/ask/deny, replaces old DenyCommandSpec)
+    tools/          Subcommand-aware evaluators for specific CLI tools
+      git.rs        GitSpec — subcommand-aware git evaluation
+      cargo.rs      CargoSpec — subcommand-aware cargo evaluation
+      kubectl.rs    KubectlSpec — subcommand-aware kubectl evaluation
+      gh.rs         GhSpec — subcommand-aware gh evaluation
   logging.rs        File appender
 tests/
   integration.rs    219 integration tests (decision_test! macro + complex tests)
@@ -39,4 +46,5 @@ config.default.toml Embedded default config
 serde, serde_json, toml, shlex, log, simplelog, tree-sitter, tree-sitter-bash
 
 ## Tests
-337 total: 118 lib (colocated) + 219 integration (in tests/integration.rs)
+343 total: 118 unit (colocated) + 225 integration (in tests/integration.rs)
+- All modules have thorough rustdoc — zero `cargo doc --document-private-items` warnings
