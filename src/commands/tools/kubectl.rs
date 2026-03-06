@@ -2,17 +2,18 @@
 //!
 //! Distinguishes read-only subcommands (get, describe, logs) from mutating ones
 //! (apply, delete, scale). Supports env-gated auto-allow for subcommands
-//! like `apply` when a specific `KUBECONFIG` is set.
+//! like `apply` when specific environment variables match.
 
 use super::super::CommandSpec;
 use crate::config::KubectlConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
+use std::collections::HashMap;
 
 /// Subcommand-aware kubectl evaluator.
 ///
 /// Evaluation order:
 /// 1. Read-only subcommands → ALLOW (with redirection escalation)
-/// 2. Env-gated subcommands → ALLOW if env var present, else ASK
+/// 2. Env-gated subcommands → ALLOW if all `config_env` entries match, else ASK
 /// 3. Known mutating subcommands → ASK
 /// 4. Everything else → ASK
 pub struct KubectlSpec {
@@ -20,10 +21,10 @@ pub struct KubectlSpec {
     read_only: Vec<String>,
     /// Known mutating subcommands that always require confirmation.
     mutating: Vec<String>,
-    /// Subcommands allowed only when `config_env_var` is present.
+    /// Subcommands allowed only when all `config_env` entries match.
     allowed_with_config: Vec<String>,
-    /// Env var name that gates `allowed_with_config` subcommands.
-    config_env_var: String,
+    /// Required env var name→value pairs that gate `allowed_with_config` subcommands.
+    config_env: HashMap<String, String>,
 }
 
 impl KubectlSpec {
@@ -33,7 +34,7 @@ impl KubectlSpec {
             read_only: config.read_only.clone(),
             mutating: config.mutating.clone(),
             allowed_with_config: config.allowed_with_config.clone(),
-            config_env_var: config.config_env_var.clone(),
+            config_env: config.config_env.clone(),
         }
     }
 
@@ -47,6 +48,13 @@ impl KubectlSpec {
             }
         }
         None
+    }
+
+    /// Format config_env keys for reason strings.
+    fn env_keys_display(&self) -> String {
+        let mut keys: Vec<&str> = self.config_env.keys().map(|k| k.as_str()).collect();
+        keys.sort();
+        keys.join(", ")
     }
 }
 
@@ -67,9 +75,9 @@ impl CommandSpec for KubectlSpec {
             };
         }
 
-        // Env-gated subcommands: allowed only when config_env_var is set and present
+        // Env-gated subcommands: allowed only when all config_env entries match
         if self.allowed_with_config.iter().any(|s| s == sub_str) {
-            if !self.config_env_var.is_empty() && ctx.has_env(&self.config_env_var) {
+            if !self.config_env.is_empty() && ctx.env_satisfies(&self.config_env) {
                 if let Some(ref r) = ctx.redirection {
                     return RuleMatch {
                         decision: Decision::Ask,
@@ -78,7 +86,7 @@ impl CommandSpec for KubectlSpec {
                 }
                 return RuleMatch {
                     decision: Decision::Allow,
-                    reason: format!("kubectl {sub_str} with {}", self.config_env_var),
+                    reason: format!("kubectl {sub_str} with {}", self.env_keys_display()),
                 };
             }
             return RuleMatch {
@@ -153,7 +161,9 @@ mod tests {
             read_only: vec!["get".into(), "describe".into()],
             mutating: vec!["delete".into()],
             allowed_with_config: vec!["apply".into(), "rollout".into()],
-            config_env_var: "KUBECONFIG".into(),
+            config_env: HashMap::from([
+                ("KUBECONFIG".into(), "~/.kube/config.ai".into()),
+            ]),
         })
     }
 
@@ -164,10 +174,18 @@ mod tests {
     }
 
     #[test]
-    fn env_gate_apply_with_config() {
+    fn env_gate_apply_with_matching_value() {
         assert_eq!(
-            eval_with_env_gate("KUBECONFIG=~/.kube/staging kubectl apply -f deploy.yaml"),
+            eval_with_env_gate("KUBECONFIG=~/.kube/config.ai kubectl apply -f deploy.yaml"),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn env_gate_apply_with_wrong_value() {
+        assert_eq!(
+            eval_with_env_gate("KUBECONFIG=~/.kube/config kubectl apply -f deploy.yaml"),
+            Decision::Ask
         );
     }
 
@@ -189,7 +207,7 @@ mod tests {
     fn env_gate_delete_still_asks() {
         // mutating commands not in allowed_with_config always ask
         assert_eq!(
-            eval_with_env_gate("KUBECONFIG=~/.kube/staging kubectl delete pod foo"),
+            eval_with_env_gate("KUBECONFIG=~/.kube/config.ai kubectl delete pod foo"),
             Decision::Ask
         );
     }

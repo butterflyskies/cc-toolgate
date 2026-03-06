@@ -7,12 +7,13 @@
 use super::super::CommandSpec;
 use crate::config::GhConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
+use std::collections::HashMap;
 
 /// Subcommand-aware gh CLI evaluator.
 ///
 /// Evaluation order:
 /// 1. Read-only subcommands → ALLOW (with redirection escalation)
-/// 2. Env-gated subcommands → ALLOW if env var present, else ASK
+/// 2. Env-gated subcommands → ALLOW if all `config_env` entries match, else ASK
 /// 3. Known mutating subcommands → ASK
 /// 4. Everything else → ASK
 pub struct GhSpec {
@@ -20,10 +21,10 @@ pub struct GhSpec {
     read_only: Vec<String>,
     /// Known mutating subcommands (e.g. `pr create`, `repo delete`).
     mutating: Vec<String>,
-    /// Subcommands allowed only when `config_env_var` is present.
+    /// Subcommands allowed only when all `config_env` entries match.
     allowed_with_config: Vec<String>,
-    /// Env var name that gates `allowed_with_config` subcommands.
-    config_env_var: String,
+    /// Required env var name→value pairs that gate `allowed_with_config` subcommands.
+    config_env: HashMap<String, String>,
 }
 
 impl GhSpec {
@@ -33,7 +34,7 @@ impl GhSpec {
             read_only: config.read_only.clone(),
             mutating: config.mutating.clone(),
             allowed_with_config: config.allowed_with_config.clone(),
-            config_env_var: config.config_env_var.clone(),
+            config_env: config.config_env.clone(),
         }
     }
 
@@ -56,6 +57,13 @@ impl GhSpec {
             .unwrap_or_else(|| "?".to_string());
         (sub_two, sub_one)
     }
+
+    /// Format config_env keys for reason strings.
+    fn env_keys_display(&self) -> String {
+        let mut keys: Vec<&str> = self.config_env.keys().map(|k| k.as_str()).collect();
+        keys.sort();
+        keys.join(", ")
+    }
 }
 
 impl CommandSpec for GhSpec {
@@ -77,11 +85,11 @@ impl CommandSpec for GhSpec {
             };
         }
 
-        // Env-gated subcommands: allowed only when config_env_var is set and present
+        // Env-gated subcommands: allowed only when all config_env entries match
         let in_env_gated = self.allowed_with_config.iter().any(|s| s == &sub_two)
             || self.allowed_with_config.iter().any(|s| s == &sub_one);
         if in_env_gated {
-            if !self.config_env_var.is_empty() && ctx.has_env(&self.config_env_var) {
+            if !self.config_env.is_empty() && ctx.env_satisfies(&self.config_env) {
                 if let Some(ref r) = ctx.redirection {
                     return RuleMatch {
                         decision: Decision::Ask,
@@ -90,7 +98,7 @@ impl CommandSpec for GhSpec {
                 }
                 return RuleMatch {
                     decision: Decision::Allow,
-                    reason: format!("gh {sub_two} with {}", self.config_env_var),
+                    reason: format!("gh {sub_two} with {}", self.env_keys_display()),
                 };
             }
             return RuleMatch {
@@ -177,7 +185,9 @@ mod tests {
             read_only: vec!["pr list".into(), "pr view".into(), "status".into()],
             mutating: vec!["repo delete".into()],
             allowed_with_config: vec!["pr create".into(), "pr merge".into()],
-            config_env_var: "GH_TOKEN".into(),
+            config_env: HashMap::from([
+                ("GH_CONFIG_DIR".into(), "~/.config/gh-ai".into()),
+            ]),
         })
     }
 
@@ -188,10 +198,18 @@ mod tests {
     }
 
     #[test]
-    fn env_gate_pr_create_with_config() {
+    fn env_gate_pr_create_with_matching_value() {
         assert_eq!(
-            eval_with_env_gate("GH_TOKEN=gho_abc123 gh pr create --title 'Fix'"),
+            eval_with_env_gate("GH_CONFIG_DIR=~/.config/gh-ai gh pr create --title 'Fix'"),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn env_gate_pr_create_with_wrong_value() {
+        assert_eq!(
+            eval_with_env_gate("GH_CONFIG_DIR=~/.config/gh gh pr create --title 'Fix'"),
+            Decision::Ask
         );
     }
 
@@ -206,7 +224,7 @@ mod tests {
     #[test]
     fn env_gate_pr_merge_with_config() {
         assert_eq!(
-            eval_with_env_gate("GH_TOKEN=gho_abc123 gh pr merge 123"),
+            eval_with_env_gate("GH_CONFIG_DIR=~/.config/gh-ai gh pr merge 123"),
             Decision::Allow
         );
     }
@@ -221,7 +239,7 @@ mod tests {
     fn env_gate_repo_delete_still_asks() {
         // mutating commands not in allowed_with_config always ask
         assert_eq!(
-            eval_with_env_gate("GH_TOKEN=gho_abc123 gh repo delete my-repo"),
+            eval_with_env_gate("GH_CONFIG_DIR=~/.config/gh-ai gh repo delete my-repo"),
             Decision::Ask
         );
     }

@@ -7,22 +7,23 @@
 use super::super::CommandSpec;
 use crate::config::GitConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
+use std::collections::HashMap;
 
 /// Subcommand-aware git evaluator.
 ///
 /// Evaluation order:
 /// 1. Force-push flags → always ASK
 /// 2. Read-only subcommands → ALLOW (with redirection escalation)
-/// 3. Env-gated subcommands → ALLOW if env var present, else ASK
+/// 3. Env-gated subcommands → ALLOW if all `config_env` entries match, else ASK
 /// 4. `--version` → ALLOW
 /// 5. Everything else → ASK
 pub struct GitSpec {
     /// Git subcommands that are always allowed (e.g. `status`, `log`, `diff`).
     read_only: Vec<String>,
-    /// Subcommands allowed only when `config_env_var` is present.
+    /// Subcommands allowed only when all `config_env` entries match.
     allowed_with_config: Vec<String>,
-    /// Env var name that gates `allowed_with_config` subcommands.
-    config_env_var: String,
+    /// Required env var name→value pairs that gate `allowed_with_config` subcommands.
+    config_env: HashMap<String, String>,
     /// Flags indicating force-push (always ASK regardless of env-gating).
     force_push_flags: Vec<String>,
 }
@@ -33,7 +34,7 @@ impl GitSpec {
         Self {
             read_only: config.read_only.clone(),
             allowed_with_config: config.allowed_with_config.clone(),
-            config_env_var: config.config_env_var.clone(),
+            config_env: config.config_env.clone(),
             force_push_flags: config.force_push_flags.clone(),
         }
     }
@@ -79,6 +80,13 @@ impl GitSpec {
             return Some(word.clone());
         }
     }
+
+    /// Format config_env keys for reason strings (e.g. "GIT_CONFIG_GLOBAL").
+    fn env_keys_display(&self) -> String {
+        let mut keys: Vec<&str> = self.config_env.keys().map(|k| k.as_str()).collect();
+        keys.sort();
+        keys.join(", ")
+    }
 }
 
 impl CommandSpec for GitSpec {
@@ -111,10 +119,9 @@ impl CommandSpec for GitSpec {
             };
         }
 
-        // Env-gated subcommands: allowed only when config_env_var is set and present
+        // Env-gated subcommands: allowed only when all config_env entries match
         if self.allowed_with_config.iter().any(|s| s == sub_str) {
-            // Feature requires config_env_var to be configured
-            if !self.config_env_var.is_empty() && ctx.has_env(&self.config_env_var) {
+            if !self.config_env.is_empty() && ctx.env_satisfies(&self.config_env) {
                 if let Some(ref r) = ctx.redirection {
                     return RuleMatch {
                         decision: Decision::Ask,
@@ -123,7 +130,7 @@ impl CommandSpec for GitSpec {
                 }
                 return RuleMatch {
                     decision: Decision::Allow,
-                    reason: format!("git {sub_str} with {}", self.config_env_var),
+                    reason: format!("git {sub_str} with {}", self.env_keys_display()),
                 };
             }
             return RuleMatch {
@@ -172,7 +179,9 @@ mod tests {
                 "branch".into(),
             ],
             allowed_with_config: vec!["push".into(), "pull".into(), "add".into()],
-            config_env_var: "GIT_CONFIG_GLOBAL".into(),
+            config_env: HashMap::from([
+                ("GIT_CONFIG_GLOBAL".into(), "~/.gitconfig.ai".into()),
+            ]),
             force_push_flags: vec!["--force".into(), "-f".into(), "--force-with-lease".into()],
         })
     }
@@ -192,7 +201,7 @@ mod tests {
 
     #[test]
     fn default_push_with_env_still_asks() {
-        // Default config has empty config_env_var, so env var presence doesn't help
+        // Default config has empty config_env, so env var presence doesn't help
         assert_eq!(
             eval("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push origin main"),
             Decision::Ask
@@ -227,10 +236,18 @@ mod tests {
     // ── Custom config with env-gated commands ──
 
     #[test]
-    fn env_gate_push_with_config() {
+    fn env_gate_push_with_matching_value() {
         assert_eq!(
             eval_with_env_gate("GIT_CONFIG_GLOBAL=~/.gitconfig.ai git push origin main"),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn env_gate_push_with_wrong_value() {
+        assert_eq!(
+            eval_with_env_gate("GIT_CONFIG_GLOBAL=~/.gitconfig git push origin main"),
+            Decision::Ask
         );
     }
 
