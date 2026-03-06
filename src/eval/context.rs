@@ -45,7 +45,13 @@ impl<'a> CommandContext<'a> {
     /// since shells expand these in env assignments before they reach the process.
     pub fn env_satisfies(&self, required: &std::collections::HashMap<String, String>) -> bool {
         required.iter().all(|(key, value)| {
-            let expanded = shellexpand::full(value).unwrap_or(std::borrow::Cow::Borrowed(value));
+            let expanded = match shellexpand::full(value) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("shellexpand failed for config_env {key}={value}: {e}");
+                    std::borrow::Cow::Borrowed(value.as_str())
+                }
+            };
             // Check inline env vars first (may contain literal ~ or expanded path)
             if let Some((_, v)) = self.env_vars.iter().find(|(k, _)| k == key) {
                 return v == value || v == expanded.as_ref();
@@ -82,6 +88,18 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// Panic unless running under nextest (process-per-test isolation).
+    ///
+    /// Tests that call `std::env::set_var` / `remove_var` are unsound under
+    /// `cargo test`, which runs tests concurrently in a single process.
+    /// Nextest sets `NEXTEST=1` in every child process.
+    fn require_nextest() {
+        assert!(
+            std::env::var("NEXTEST").is_ok(),
+            "this test mutates process env and requires nextest (cargo nextest run)"
+        );
+    }
+
     #[test]
     fn env_satisfies_inline_exact() {
         let ctx = CommandContext::from_command("FOO=bar git push");
@@ -106,9 +124,9 @@ mod tests {
 
     #[test]
     fn env_satisfies_process_env() {
-        // Set a unique env var for this test
+        require_nextest();
         let key = "CC_TOOLGATE_TEST_PROCESS_ENV";
-        // SAFETY: test-only, nextest runs each test in its own process
+        // SAFETY: nextest runs each test in its own process (verified by require_nextest)
         unsafe { std::env::set_var(key, "expected_value") };
         let ctx = CommandContext::from_command("git push");
         let req = HashMap::from([(key.into(), "expected_value".into())]);
@@ -118,8 +136,9 @@ mod tests {
 
     #[test]
     fn env_satisfies_process_env_wrong_value() {
+        require_nextest();
         let key = "CC_TOOLGATE_TEST_WRONG_VALUE";
-        // SAFETY: test-only, nextest runs each test in its own process
+        // SAFETY: nextest runs each test in its own process (verified by require_nextest)
         unsafe { std::env::set_var(key, "actual") };
         let ctx = CommandContext::from_command("git push");
         let req = HashMap::from([(key.into(), "expected".into())]);
@@ -129,9 +148,9 @@ mod tests {
 
     #[test]
     fn env_satisfies_multi_source_one_inline_one_process() {
-        // Simulates hook environment providing one var, command providing another
+        require_nextest();
         let key_process = "CC_TOOLGATE_TEST_MULTI_PROC";
-        // SAFETY: test-only, nextest runs each test in its own process
+        // SAFETY: nextest runs each test in its own process (verified by require_nextest)
         unsafe { std::env::set_var(key_process, "/correct/path") };
         let ctx = CommandContext::from_command("INLINE_VAR=correct git push");
         let req = HashMap::from([
@@ -144,7 +163,7 @@ mod tests {
 
     #[test]
     fn env_satisfies_multi_source_one_missing() {
-        // One var satisfied via inline, other not set anywhere → fails
+        // No env mutation — safe under cargo test
         let ctx = CommandContext::from_command("INLINE_VAR=correct git push");
         let req = HashMap::from([
             ("INLINE_VAR".into(), "correct".into()),
@@ -155,9 +174,9 @@ mod tests {
 
     #[test]
     fn env_satisfies_multi_source_one_wrong() {
-        // Both set, but process env has wrong value → fails
+        require_nextest();
         let key_process = "CC_TOOLGATE_TEST_MULTI_WRONG";
-        // SAFETY: test-only, nextest runs each test in its own process
+        // SAFETY: nextest runs each test in its own process (verified by require_nextest)
         unsafe { std::env::set_var(key_process, "/wrong/path") };
         let ctx = CommandContext::from_command("INLINE_VAR=correct git push");
         let req = HashMap::from([
@@ -170,10 +189,10 @@ mod tests {
 
     #[test]
     fn env_satisfies_tilde_expansion() {
-        // Config says ~/foo, process env has /home/user/foo
+        require_nextest();
         let key = "CC_TOOLGATE_TEST_TILDE";
         let home = std::env::var("HOME").unwrap();
-        // SAFETY: test-only, nextest runs each test in its own process
+        // SAFETY: nextest runs each test in its own process (verified by require_nextest)
         unsafe { std::env::set_var(key, format!("{home}/foo")) };
         let ctx = CommandContext::from_command("git push");
         let req = HashMap::from([(key.into(), "~/foo".into())]);
@@ -185,5 +204,39 @@ mod tests {
     fn env_satisfies_empty_map() {
         let ctx = CommandContext::from_command("git push");
         assert!(ctx.env_satisfies(&HashMap::new()));
+    }
+
+    // ── Collision tests ──
+    //
+    // These two tests use the SAME env var key with DIFFERENT expected values.
+    // Under nextest (process-per-test), both pass reliably because each process
+    // has its own environment. Under `cargo test` (shared process, concurrent
+    // threads), one would see the other's write and produce a wrong result.
+
+    const COLLISION_KEY: &str = "CC_TOOLGATE_TEST_COLLISION";
+
+    #[test]
+    fn env_collision_value_alpha() {
+        require_nextest();
+        // SAFETY: nextest runs each test in its own process (verified by require_nextest)
+        unsafe { std::env::set_var(COLLISION_KEY, "alpha") };
+        // Spin briefly to widen the race window under concurrent execution
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let ctx = CommandContext::from_command("git push");
+        let req = HashMap::from([(COLLISION_KEY.into(), "alpha".into())]);
+        assert!(ctx.env_satisfies(&req), "expected 'alpha', env was tampered");
+        unsafe { std::env::remove_var(COLLISION_KEY) };
+    }
+
+    #[test]
+    fn env_collision_value_beta() {
+        require_nextest();
+        // SAFETY: nextest runs each test in its own process (verified by require_nextest)
+        unsafe { std::env::set_var(COLLISION_KEY, "beta") };
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let ctx = CommandContext::from_command("git push");
+        let req = HashMap::from([(COLLISION_KEY.into(), "beta".into())]);
+        assert!(ctx.env_satisfies(&req), "expected 'beta', env was tampered");
+        unsafe { std::env::remove_var(COLLISION_KEY) };
     }
 }
