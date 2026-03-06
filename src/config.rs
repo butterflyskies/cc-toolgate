@@ -7,6 +7,7 @@
 //! `remove_<field>` subtracts, and `replace = true` replaces entirely.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Embedded default configuration (compiled into the binary from `config.default.toml`).
 const DEFAULT_CONFIG: &str = include_str!("../config.default.toml");
@@ -88,14 +89,16 @@ pub struct GitConfig {
     /// Subcommands that are always allowed (e.g. `status`, `log`, `diff`, `branch`).
     #[serde(default)]
     pub read_only: Vec<String>,
-    /// Subcommands that are allowed only when `config_env_var` is set in the command's
-    /// environment (e.g. `push`, `pull` when `GIT_CONFIG_GLOBAL` is present).
+    /// Subcommands that are allowed only when all `config_env` entries match
+    /// (e.g. `push`, `pull` when `GIT_CONFIG_GLOBAL=~/.gitconfig.ai`).
     #[serde(default)]
     pub allowed_with_config: Vec<String>,
-    /// Env var that must be set for `allowed_with_config` commands to auto-allow.
+    /// Environment variable requirements for `allowed_with_config` subcommands.
+    /// Each entry maps a var name to its required value. All must match (AND).
+    /// Checked in the command's inline env first, then the process environment.
     /// When empty, the env-gating feature is disabled and those commands always ASK.
     #[serde(default)]
-    pub config_env_var: String,
+    pub config_env: HashMap<String, String>,
     /// Flags that indicate a force-push (e.g. `--force`, `-f`, `--force-with-lease`).
     /// Force-pushes always require confirmation regardless of env-gating.
     #[serde(default)]
@@ -108,12 +111,12 @@ pub struct CargoConfig {
     /// Subcommands that are always allowed (e.g. `build`, `test`, `check`, `clippy`).
     #[serde(default)]
     pub safe_subcommands: Vec<String>,
-    /// Subcommands allowed only when `config_env_var` is set.
+    /// Subcommands allowed only when all `config_env` entries match.
     #[serde(default)]
     pub allowed_with_config: Vec<String>,
-    /// Env var that gates `allowed_with_config` subcommands.
+    /// Environment variable requirements for `allowed_with_config` subcommands.
     #[serde(default)]
-    pub config_env_var: String,
+    pub config_env: HashMap<String, String>,
 }
 
 /// kubectl subcommand evaluation rules.
@@ -125,12 +128,12 @@ pub struct KubectlConfig {
     /// Known mutating subcommands that always require confirmation (e.g. `apply`, `delete`).
     #[serde(default)]
     pub mutating: Vec<String>,
-    /// Subcommands allowed only when `config_env_var` is set.
+    /// Subcommands allowed only when all `config_env` entries match.
     #[serde(default)]
     pub allowed_with_config: Vec<String>,
-    /// Env var that gates `allowed_with_config` subcommands.
+    /// Environment variable requirements for `allowed_with_config` subcommands.
     #[serde(default)]
-    pub config_env_var: String,
+    pub config_env: HashMap<String, String>,
 }
 
 /// GitHub CLI (gh) subcommand evaluation rules.
@@ -145,12 +148,12 @@ pub struct GhConfig {
     /// Known mutating subcommands (e.g. `pr create`, `pr merge`, `repo delete`).
     #[serde(default)]
     pub mutating: Vec<String>,
-    /// Subcommands allowed only when `config_env_var` is set.
+    /// Subcommands allowed only when all `config_env` entries match.
     #[serde(default)]
     pub allowed_with_config: Vec<String>,
-    /// Env var that gates `allowed_with_config` subcommands.
+    /// Environment variable requirements for `allowed_with_config` subcommands.
     #[serde(default)]
-    pub config_env_var: String,
+    pub config_env: HashMap<String, String>,
 }
 
 // ── Overlay types (user config that merges with defaults) ──
@@ -222,7 +225,7 @@ struct GitOverlay {
     read_only: Vec<String>,
     #[serde(default)]
     allowed_with_config: Vec<String>,
-    config_env_var: Option<String>,
+    config_env: Option<HashMap<String, String>>,
     #[serde(default)]
     force_push_flags: Vec<String>,
     #[serde(default)]
@@ -241,7 +244,7 @@ struct CargoOverlay {
     safe_subcommands: Vec<String>,
     #[serde(default)]
     allowed_with_config: Vec<String>,
-    config_env_var: Option<String>,
+    config_env: Option<HashMap<String, String>>,
     #[serde(default)]
     remove_safe_subcommands: Vec<String>,
     #[serde(default)]
@@ -258,7 +261,7 @@ struct KubectlOverlay {
     mutating: Vec<String>,
     #[serde(default)]
     allowed_with_config: Vec<String>,
-    config_env_var: Option<String>,
+    config_env: Option<HashMap<String, String>>,
     #[serde(default)]
     remove_read_only: Vec<String>,
     #[serde(default)]
@@ -277,7 +280,7 @@ struct GhOverlay {
     mutating: Vec<String>,
     #[serde(default)]
     allowed_with_config: Vec<String>,
-    config_env_var: Option<String>,
+    config_env: Option<HashMap<String, String>>,
     #[serde(default)]
     remove_read_only: Vec<String>,
     #[serde(default)]
@@ -392,8 +395,8 @@ impl Config {
             &g.remove_force_push_flags,
             g.replace,
         );
-        if let Some(v) = g.config_env_var {
-            self.git.config_env_var = v;
+        if let Some(v) = g.config_env {
+            self.git.config_env = v;
         }
 
         // Cargo
@@ -410,8 +413,8 @@ impl Config {
             &ca.remove_allowed_with_config,
             ca.replace,
         );
-        if let Some(v) = ca.config_env_var {
-            self.cargo.config_env_var = v;
+        if let Some(v) = ca.config_env {
+            self.cargo.config_env = v;
         }
 
         // Kubectl
@@ -434,8 +437,8 @@ impl Config {
             &k.remove_allowed_with_config,
             k.replace,
         );
-        if let Some(v) = k.config_env_var {
-            self.kubectl.config_env_var = v;
+        if let Some(v) = k.config_env {
+            self.kubectl.config_env = v;
         }
 
         // Gh
@@ -458,8 +461,8 @@ impl Config {
             &gh.remove_allowed_with_config,
             gh.replace,
         );
-        if let Some(v) = gh.config_env_var {
-            self.gh.config_env_var = v;
+        if let Some(v) = gh.config_env {
+            self.gh.config_env = v;
         }
     }
 
@@ -504,7 +507,7 @@ mod tests {
     #[test]
     fn default_git_env_gate_disabled() {
         let config = Config::default_config();
-        assert!(config.git.config_env_var.is_empty());
+        assert!(config.git.config_env.is_empty());
         assert!(config.git.allowed_with_config.is_empty());
     }
 
@@ -609,10 +612,14 @@ mod tests {
             r#"
             [git]
             allowed_with_config = ["commit", "add", "push"]
-            config_env_var = "GIT_CONFIG_GLOBAL"
+            [git.config_env]
+            GIT_CONFIG_GLOBAL = "~/.gitconfig.ai"
         "#,
         );
-        assert_eq!(config.git.config_env_var, "GIT_CONFIG_GLOBAL");
+        assert_eq!(
+            config.git.config_env.get("GIT_CONFIG_GLOBAL").unwrap(),
+            "~/.gitconfig.ai"
+        );
         assert_eq!(
             config.git.allowed_with_config,
             vec!["commit", "add", "push"]

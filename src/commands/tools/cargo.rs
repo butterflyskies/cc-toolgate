@@ -6,21 +6,22 @@
 use super::super::CommandSpec;
 use crate::config::CargoConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
+use std::collections::HashMap;
 
 /// Subcommand-aware cargo evaluator.
 ///
 /// Evaluation order:
 /// 1. Safe subcommands → ALLOW (with redirection escalation)
-/// 2. Env-gated subcommands → ALLOW if env var present, else ASK
+/// 2. Env-gated subcommands → ALLOW if all `config_env` entries match, else ASK
 /// 3. `--version` / `-V` → ALLOW
 /// 4. Everything else → ASK
 pub struct CargoSpec {
     /// Subcommands that are always safe (e.g. `build`, `test`, `check`).
     safe_subcommands: Vec<String>,
-    /// Subcommands allowed only when `config_env_var` is present.
+    /// Subcommands allowed only when all `config_env` entries match.
     allowed_with_config: Vec<String>,
-    /// Env var name that gates `allowed_with_config` subcommands.
-    config_env_var: String,
+    /// Required env var name→value pairs that gate `allowed_with_config` subcommands.
+    config_env: HashMap<String, String>,
 }
 
 impl CargoSpec {
@@ -29,7 +30,7 @@ impl CargoSpec {
         Self {
             safe_subcommands: config.safe_subcommands.clone(),
             allowed_with_config: config.allowed_with_config.clone(),
-            config_env_var: config.config_env_var.clone(),
+            config_env: config.config_env.clone(),
         }
     }
 
@@ -43,6 +44,13 @@ impl CargoSpec {
             }
         }
         None
+    }
+
+    /// Format config_env keys for reason strings.
+    fn env_keys_display(&self) -> String {
+        let mut keys: Vec<&str> = self.config_env.keys().map(|k| k.as_str()).collect();
+        keys.sort();
+        keys.join(", ")
     }
 }
 
@@ -63,9 +71,9 @@ impl CommandSpec for CargoSpec {
             };
         }
 
-        // Env-gated subcommands: allowed only when config_env_var is set and present
+        // Env-gated subcommands: allowed only when all config_env entries match
         if self.allowed_with_config.iter().any(|s| s == sub_str) {
-            if !self.config_env_var.is_empty() && ctx.has_env(&self.config_env_var) {
+            if !self.config_env.is_empty() && ctx.env_satisfies(&self.config_env) {
                 if let Some(ref r) = ctx.redirection {
                     return RuleMatch {
                         decision: Decision::Ask,
@@ -74,7 +82,7 @@ impl CommandSpec for CargoSpec {
                 }
                 return RuleMatch {
                     decision: Decision::Allow,
-                    reason: format!("cargo {sub_str} with {}", self.config_env_var),
+                    reason: format!("cargo {sub_str} with {}", self.env_keys_display()),
                 };
             }
             return RuleMatch {
@@ -159,7 +167,9 @@ mod tests {
         CargoSpec::from_config(&CargoConfig {
             safe_subcommands: vec!["build".into(), "check".into(), "test".into()],
             allowed_with_config: vec!["install".into(), "publish".into()],
-            config_env_var: "CARGO_INSTALL_ROOT".into(),
+            config_env: HashMap::from([
+                ("CARGO_INSTALL_ROOT".into(), "/tmp/bin".into()),
+            ]),
         })
     }
 
@@ -170,10 +180,18 @@ mod tests {
     }
 
     #[test]
-    fn env_gate_install_with_config() {
+    fn env_gate_install_with_matching_value() {
         assert_eq!(
             eval_with_env_gate("CARGO_INSTALL_ROOT=/tmp/bin cargo install ripgrep"),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn env_gate_install_with_wrong_value() {
+        assert_eq!(
+            eval_with_env_gate("CARGO_INSTALL_ROOT=/usr/local cargo install ripgrep"),
+            Decision::Ask
         );
     }
 

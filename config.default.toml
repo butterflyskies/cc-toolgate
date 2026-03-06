@@ -12,7 +12,8 @@
 #
 #   [git]
 #   allowed_with_config = ["commit", "add", "push"]
-#   config_env_var = "GIT_CONFIG_GLOBAL"
+#   [git.config_env]
+#   GIT_CONFIG_GLOBAL = "~/.gitconfig.ai"
 #
 #   [commands]
 #   remove_deny = ["eval"]          # move eval from deny to ask
@@ -103,22 +104,21 @@ ask_floor = [
 ]
 
 [git]
-# Subcommands allowed without AI gitconfig (read-only, safe).
+# Subcommands allowed without config_env (read-only, safe).
 read_only = [
     "status", "log", "diff", "show", "branch", "tag", "remote",
     "rev-parse", "ls-files", "ls-tree", "shortlog",
     "blame", "describe", "stash",
 ]
 
-# Subcommands auto-allowed only when `config_env_var` is present.
-# Empty by default — enable in your custom config if you use a separate
-# AI gitconfig (e.g. GIT_CONFIG_GLOBAL=~/.gitconfig.ai).
+# Subcommands auto-allowed only when all config_env entries match.
+# Empty by default — enable in your custom config.
 #
 # Example custom config to enable:
 #   allowed_with_config = ["push", "pull", "add"]
-#   config_env_var = "GIT_CONFIG_GLOBAL"
+#   [git.config_env]
+#   GIT_CONFIG_GLOBAL = "~/.gitconfig.ai"
 allowed_with_config = []
-config_env_var = ""
 
 # Flags that escalate push to ASK regardless of config.
 force_push_flags = ["--force", "--force-with-lease", "-f"]
@@ -134,11 +134,12 @@ safe_subcommands = [
     "verify-project", "search", "generate-lockfile",
 ]
 
-# Subcommands auto-allowed only when `config_env_var` is present.
-# Example: allowed_with_config = ["install"]
-#          config_env_var = "CARGO_INSTALL_ROOT"
+# Subcommands auto-allowed only when all config_env entries match.
+# Example:
+#   allowed_with_config = ["install"]
+#   [cargo.config_env]
+#   CARGO_INSTALL_ROOT = "/tmp/bin"
 allowed_with_config = []
-config_env_var = ""
 
 [kubectl]
 read_only = [
@@ -153,11 +154,12 @@ mutating = [
     "exec", "run", "port-forward", "cp",
 ]
 
-# Subcommands auto-allowed only when `config_env_var` is present.
-# Example: allowed_with_config = ["apply", "rollout"]
-#          config_env_var = "KUBECONFIG"
+# Subcommands auto-allowed only when all config_env entries match.
+# Example:
+#   allowed_with_config = ["apply", "rollout"]
+#   [kubectl.config_env]
+#   KUBECONFIG = "~/.kube/config.ai"
 allowed_with_config = []
-config_env_var = ""
 
 [gh]
 # Two-word subcommands (e.g. "pr list") and one-word (e.g. "status").
@@ -195,8 +197,9 @@ mutating = [
     "config set",
 ]
 
-# Subcommands auto-allowed only when `config_env_var` is present.
-# Example: allowed_with_config = ["pr create", "pr merge"]
-#          config_env_var = "GH_TOKEN"
+# Subcommands auto-allowed only when all config_env entries match.
+# Example:
+#   allowed_with_config = ["pr create", "pr merge"]
+#   [gh.config_env]
+#   GH_CONFIG_DIR = "~/.config/gh-my-ai"
 allowed_with_config = []
-config_env_var = ""
