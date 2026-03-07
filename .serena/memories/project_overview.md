@@ -40,6 +40,12 @@ config.default.toml Embedded default config
   claude.yml              @claude mention handler
 ```
 
+## Key Types (src/eval/mod.rs — free functions)
+- `is_likely_successful(segment)` — heuristic for && chain propagation
+- `extract_segment_env(segment)` — KEY=VALUE from export/bare assignment
+- `extract_unset_vars(segment)` — variable names from unset commands
+- `parse_assignment(token)` / `is_var_name(s)` — shared helpers
+
 ## Key Types (src/parse/types.rs)
 - `ParsedPipeline { segments: Vec<ShellSegment>, operators: Vec<Operator> }`
 - `ShellSegment { command: String, redirection: Option<Redirection> }`
