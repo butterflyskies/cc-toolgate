@@ -15,6 +15,9 @@ pub struct CommandContext<'a> {
     pub env_vars: Vec<(String, String)>,
     /// Detected output redirection, if any.
     pub redirection: Option<Redirection>,
+    /// Environment variables accumulated from prior segments in a compound command
+    /// (e.g. `export FOO=bar ; git push` makes FOO=bar available to the git push segment).
+    pub accumulated_env: std::collections::HashMap<String, String>,
 }
 
 impl<'a> CommandContext<'a> {
@@ -31,6 +34,7 @@ impl<'a> CommandContext<'a> {
             words,
             env_vars,
             redirection,
+            accumulated_env: std::collections::HashMap::new(),
         }
     }
 
@@ -54,6 +58,10 @@ impl<'a> CommandContext<'a> {
             };
             // Check inline env vars first (may contain literal ~ or expanded path)
             if let Some((_, v)) = self.env_vars.iter().find(|(k, _)| k == key) {
+                return v == value || v == expanded.as_ref();
+            }
+            // Check accumulated env from prior compound-command segments
+            if let Some(v) = self.accumulated_env.get(key) {
                 return v == value || v == expanded.as_ref();
             }
             // Fall back to process environment (shell will have expanded already)
@@ -224,7 +232,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         let ctx = CommandContext::from_command("git push");
         let req = HashMap::from([(COLLISION_KEY.into(), "alpha".into())]);
-        assert!(ctx.env_satisfies(&req), "expected 'alpha', env was tampered");
+        assert!(
+            ctx.env_satisfies(&req),
+            "expected 'alpha', env was tampered"
+        );
         unsafe { std::env::remove_var(COLLISION_KEY) };
     }
 

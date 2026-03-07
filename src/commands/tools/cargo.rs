@@ -167,9 +167,7 @@ mod tests {
         CargoSpec::from_config(&CargoConfig {
             safe_subcommands: vec!["build".into(), "check".into(), "test".into()],
             allowed_with_config: vec!["install".into(), "publish".into()],
-            config_env: HashMap::from([
-                ("CARGO_INSTALL_ROOT".into(), "/tmp/bin".into()),
-            ]),
+            config_env: HashMap::from([("CARGO_INSTALL_ROOT".into(), "/tmp/bin".into())]),
         })
     }
 

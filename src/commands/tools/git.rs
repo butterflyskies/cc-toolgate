@@ -179,9 +179,7 @@ mod tests {
                 "branch".into(),
             ],
             allowed_with_config: vec!["push".into(), "pull".into(), "add".into()],
-            config_env: HashMap::from([
-                ("GIT_CONFIG_GLOBAL".into(), "~/.gitconfig.ai".into()),
-            ]),
+            config_env: HashMap::from([("GIT_CONFIG_GLOBAL".into(), "~/.gitconfig.ai".into())]),
             force_push_flags: vec!["--force".into(), "-f".into(), "--force-with-lease".into()],
         })
     }

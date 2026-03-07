@@ -185,9 +185,7 @@ mod tests {
             read_only: vec!["pr list".into(), "pr view".into(), "status".into()],
             mutating: vec!["repo delete".into()],
             allowed_with_config: vec!["pr create".into(), "pr merge".into()],
-            config_env: HashMap::from([
-                ("GH_CONFIG_DIR".into(), "~/.config/gh-ai".into()),
-            ]),
+            config_env: HashMap::from([("GH_CONFIG_DIR".into(), "~/.config/gh-ai".into())]),
         })
     }
 

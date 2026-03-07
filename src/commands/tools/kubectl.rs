@@ -161,9 +161,7 @@ mod tests {
             read_only: vec!["get".into(), "describe".into()],
             mutating: vec!["delete".into()],
             allowed_with_config: vec!["apply".into(), "rollout".into()],
-            config_env: HashMap::from([
-                ("KUBECONFIG".into(), "~/.kube/config.ai".into()),
-            ]),
+            config_env: HashMap::from([("KUBECONFIG".into(), "~/.kube/config.ai".into())]),
         })
     }
 

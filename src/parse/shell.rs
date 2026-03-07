@@ -882,7 +882,15 @@ pub fn dump_ast(command: &str) -> String {
         let text = node.utf8_text(source).unwrap_or("???");
         let short: String = text.chars().take(60).collect();
         let tag = if node.is_named() { "named" } else { "anon" };
-        writeln!(out, "{}{} [{}] {:?}", "  ".repeat(indent), node.kind(), tag, short).unwrap();
+        writeln!(
+            out,
+            "{}{} [{}] {:?}",
+            "  ".repeat(indent),
+            node.kind(),
+            tag,
+            short
+        )
+        .unwrap();
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             print_node(out, child, source, indent + 1);
@@ -894,7 +902,11 @@ pub fn dump_ast(command: &str) -> String {
     let (pipeline, substitutions) = parse_with_substitutions(command);
     writeln!(out, "\n── parsed pipeline ──").unwrap();
     for (i, seg) in pipeline.segments.iter().enumerate() {
-        let redir = seg.redirection.as_ref().map(|r| format!(" [{}]", r.description)).unwrap_or_default();
+        let redir = seg
+            .redirection
+            .as_ref()
+            .map(|r| format!(" [{}]", r.description))
+            .unwrap_or_default();
         writeln!(out, "  segment {}: {:?}{}", i, seg.command, redir).unwrap();
         if i < pipeline.operators.len() {
             writeln!(out, "  operator: {}", pipeline.operators[i].as_str()).unwrap();
@@ -1095,7 +1107,10 @@ mod tests {
     #[test]
     fn redir_clobber() {
         let r = has_output_redirection("echo hi >| file.txt");
-        assert!(r.is_some(), "expected >| to be flagged as output redirection");
+        assert!(
+            r.is_some(),
+            "expected >| to be flagged as output redirection"
+        );
         assert!(r.unwrap().description.contains(">|"));
     }
 
@@ -1109,7 +1124,10 @@ mod tests {
         // tree-sitter-bash parses `<>` as `<` + ERROR(`>`). We detect the
         // ERROR child and flag it as output redirection.
         let r = has_output_redirection("cat <> file.txt");
-        assert!(r.is_some(), "expected <> to be flagged as output redirection");
+        assert!(
+            r.is_some(),
+            "expected <> to be flagged as output redirection"
+        );
         assert!(r.unwrap().description.contains("<>"));
     }
 
