@@ -3,7 +3,7 @@ name = "cc-toolgate"
 version = "0.6.0"
 edition = "2024"
 description = "PreToolUse hook for Claude Code that gates Bash commands with compound-command-aware validation"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
