@@ -63,6 +63,44 @@ jobs:
           gh run watch "$run_id" --repo "${{ github.repository }}" --exit-status > /dev/null
           echo "CI run $run_id passed."
 
+  # Build release binaries and upload them as GitHub release assets.
+  publish-binaries:
+    needs: [release-please, ci-gate]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            build-tool: cargo
+          - target: universal-apple-darwin
+            os: macos-latest
+            build-tool: cargo
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            build-tool: cargo
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master (2026-02-13)
+        with:
+          toolchain: stable
+      - uses: taiki-e/upload-rust-binary-action@0e34102c043ded9f2ca39f7af5cd99a540c61aff # v1.29.1
+        with:
+          bin: cc-toolgate
+          target: ${{ matrix.target }}
+          build-tool: ${{ matrix.build-tool }}
+          archive: cc-toolgate-$tag-$target
+          tar: all
+          zip: windows
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: refs/tags/${{ needs.release-please.outputs.tag_name }}
+
   publish-crate:
     needs: [release-please, ci-gate]
     runs-on: ubuntu-latest
@@ -84,8 +122,9 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
+  # Undraft the release after all artifacts (binaries + crate) are uploaded.
   publish-release:
-    needs: [release-please, publish-crate]
+    needs: [release-please, publish-binaries, publish-crate]
     runs-on: ubuntu-latest
     permissions:
       contents: write
