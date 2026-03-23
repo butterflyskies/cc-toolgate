@@ -325,12 +325,13 @@ impl WalkResult {
 ///
 /// Apply a wrapping redirection to segments from a compound body.
 ///
-/// For `list` nodes (`&&`/`||`/`;` chains) only the last segment receives the
-/// redirect — earlier segments are independent commands whose output is not
-/// redirected.  For control-flow bodies (`for`/`while`/`if`/`case`) every
-/// segment is wrapped by the construct, so all receive the redirect.
+/// For `list` nodes (`&&`/`||`/`;` chains) and `pipeline` nodes (`|`/`|&`
+/// chains) only the last segment receives the redirect — earlier segments are
+/// independent commands whose output goes to the next pipe stage and is not
+/// itself redirected.  For control-flow bodies (`for`/`while`/`if`/`case`)
+/// every segment is wrapped by the construct, so all receive the redirect.
 fn propagate_redirect(result: &mut WalkResult, node_kind: &str, redir: &Redirection) {
-    if node_kind == "list" {
+    if node_kind == "list" || node_kind == "pipeline" {
         if let Some(last) = result.segments.last_mut()
             && last.redirection.is_none()
         {
@@ -1344,6 +1345,63 @@ mod tests {
             p.segments[2].redirection.is_some(),
             "last segment must carry redirection: {:?}",
             p.segments[2],
+        );
+    }
+
+    #[test]
+    fn redirect_pipeline_only_last_segment_gets_redir() {
+        // `echo hello | cat > /tmp/file` — only the last pipeline stage (cat)
+        // should carry the redirection; earlier stages' stdout goes to the pipe.
+        let (p, _) = parse_with_substitutions("echo hello | cat > /tmp/file");
+        assert_eq!(p.segments.len(), 2, "expected 2 segments: {:?}", p.segments);
+        assert!(
+            p.segments[0].redirection.is_none(),
+            "first pipeline stage must NOT carry redirection: {:?}",
+            p.segments[0],
+        );
+        assert!(
+            p.segments[1].redirection.is_some(),
+            "last pipeline stage must carry redirection: {:?}",
+            p.segments[1],
+        );
+    }
+
+    #[test]
+    fn redirect_pipeline_three_stages_only_last_gets_redir() {
+        // `a | b | c > file` — 3 pipeline stages, only last gets redirect.
+        let (p, _) = parse_with_substitutions("a | b | c > file");
+        assert_eq!(p.segments.len(), 3, "expected 3 segments: {:?}", p.segments);
+        assert!(
+            p.segments[0].redirection.is_none(),
+            "segment 0 must NOT carry redirection: {:?}",
+            p.segments[0],
+        );
+        assert!(
+            p.segments[1].redirection.is_none(),
+            "segment 1 must NOT carry redirection: {:?}",
+            p.segments[1],
+        );
+        assert!(
+            p.segments[2].redirection.is_some(),
+            "last segment must carry redirection: {:?}",
+            p.segments[2],
+        );
+    }
+
+    #[test]
+    fn redirect_pipeline_stderr_only_last_gets_redir() {
+        // `a |& b > file` — |& produces the same `pipeline` node kind as |.
+        let (p, _) = parse_with_substitutions("a |& b > file");
+        assert_eq!(p.segments.len(), 2, "expected 2 segments: {:?}", p.segments);
+        assert!(
+            p.segments[0].redirection.is_none(),
+            "first stage must NOT carry redirection: {:?}",
+            p.segments[0],
+        );
+        assert!(
+            p.segments[1].redirection.is_some(),
+            "last stage must carry redirection: {:?}",
+            p.segments[1],
         );
     }
 

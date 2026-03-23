@@ -667,3 +667,27 @@ fn export_and_assign_before_redirect_segments_not_escalated() {
         "cat escalation reason must mention redirection, got: {reason}"
     );
 }
+
+// ── Pipeline redirection propagation (issue #37) ──
+
+decision_test!(
+    pipeline_with_trailing_redirect_asks,
+    "echo hello | cat > /tmp/file",
+    Ask
+);
+
+#[test]
+fn pipeline_redirect_only_last_stage_escalated() {
+    // Overall decision covered by pipeline_with_trailing_redirect_asks above;
+    // this test verifies per-segment eval results via the reason string.
+    let result = cc_toolgate::evaluate("echo hello | cat > /tmp/file");
+    let reason = &result.reason;
+    assert!(
+        reason.contains("echo hello") && reason.contains("ALLOW"),
+        "echo stage must be ALLOW, got: {reason}"
+    );
+    assert!(
+        reason.contains("cat") && reason.contains("ASK"),
+        "cat stage must be ASK (redirected), got: {reason}"
+    );
+}
