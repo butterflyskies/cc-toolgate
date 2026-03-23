@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# Must queue, not cancel — cancelling mid-run can corrupt the release-please manifest.
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+      - id: release
+        uses: googleapis/release-please-action@8bb7a2ed0f90c9802c83129a9488d235a1f31a7c # main (2026-02-20, includes release-please 17.3.0 with force-tag-creation)
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          token: ${{ steps.app-token.outputs.token }}
+
+  ci-gate:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Wait for CI to pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Waiting for CI workflow on ${{ github.sha }}..."
+          for attempt in $(seq 1 20); do
+            run_id=$(gh run list --repo "${{ github.repository }}" --workflow=build.yml \
+              --event=push --commit="${{ github.sha }}" --limit=1 --json databaseId -q '.[0].databaseId')
+            [ -n "$run_id" ] && break
+            echo "CI run not found yet, retrying in 30s (attempt $attempt/20)..."
+            sleep 30
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::CI run not found for ${{ github.sha }} after 10 minutes"
+            exit 1
+          fi
+          echo "Found CI run $run_id, waiting for completion..."
+          gh run watch "$run_id" --repo "${{ github.repository }}" --exit-status > /dev/null
+          echo "CI run $run_id passed."
+
+  publish-crate:
+    needs: [release-please, ci-gate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment: release
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master (2026-02-13)
+        with:
+          toolchain: stable
+      - name: Get crates.io token via trusted publishing
+        id: auth
+        uses: rust-lang/crates-io-auth-action@b7e9a28eded4986ec6b1fa40eeee8f8f165559ec # v1.0.3
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  publish-release:
+    needs: [release-please, publish-crate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${{ needs.release-please.outputs.tag_name }}" \
+            --draft=false \
+            --repo "${{ github.repository }}"
