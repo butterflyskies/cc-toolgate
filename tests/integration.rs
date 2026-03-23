@@ -623,3 +623,47 @@ fn heredoc_quoted_subst_not_expanded() {
         "quoted heredoc suppresses expansion, cat alone is allowed"
     );
 }
+
+// ── Redirection propagation: list vs. control-flow (issue #36) ──
+
+decision_test!(
+    allow_export_and_assign_before_redirect,
+    "export FOO=bar && REPO_ID=$(echo test) && cat > /tmp/file",
+    Ask
+);
+
+#[test]
+fn export_and_assign_before_redirect_segments_not_escalated() {
+    // The export and assignment segments must not be escalated to Ask
+    // just because the final `cat > /tmp/file` carries a redirect.
+    // They are independent commands in a list (&&-chain) and their output
+    // is not redirected.
+    let result = cc_toolgate::evaluate("export FOO=bar && REPO_ID=$(echo test) && cat > /tmp/file");
+    assert_eq!(
+        result.decision,
+        Decision::Ask,
+        "overall decision must be Ask (cat redirects)"
+    );
+
+    // The reason string contains per-segment lines.  Verify that export and
+    // assignment segments are ALLOW (not escalated) while cat is ASK.
+    // These assertions verify per-segment eval results via the reason string.
+    // The format is an internal detail; if it changes, update these assertions.
+    let reason = &result.reason;
+    assert!(
+        reason.contains("export FOO=bar") && reason.contains("ALLOW"),
+        "export segment must be ALLOW, got: {reason}"
+    );
+    assert!(
+        reason.contains("variable assignment") && reason.contains("ALLOW"),
+        "assignment segment must be ALLOW, got: {reason}"
+    );
+    assert!(
+        reason.contains("[cat]") && reason.contains("ASK"),
+        "cat segment must be ASK (redirected), got: {reason}"
+    );
+    assert!(
+        reason.contains("escalated") && reason.contains("redirection"),
+        "cat escalation reason must mention redirection, got: {reason}"
+    );
+}

@@ -493,6 +493,16 @@ impl CommandRegistry {
 mod tests {
     use super::*;
 
+    /// Clear `GIT_CONFIG_GLOBAL` from the process environment so the
+    /// env-gate fallback in `env_satisfies` doesn't interfere.  Requires nextest.
+    fn clear_git_env() {
+        assert!(
+            std::env::var("NEXTEST").is_ok(),
+            "this test mutates process env and requires nextest (cargo nextest run)"
+        );
+        unsafe { std::env::remove_var("GIT_CONFIG_GLOBAL") };
+    }
+
     // ── is_likely_successful ──
 
     #[test]
@@ -662,6 +672,7 @@ mod tests {
 
     #[test]
     fn export_or_git_push_does_not_allow() {
+        clear_git_env();
         // || means git push runs only if export failed → env not set
         let reg = registry_with_git_env_gate();
         let result =
@@ -671,6 +682,7 @@ mod tests {
 
     #[test]
     fn export_pipe_git_push_does_not_allow() {
+        clear_git_env();
         // | means subshell boundary → env doesn't propagate
         let reg = registry_with_git_env_gate();
         let result =
@@ -764,6 +776,7 @@ mod tests {
 
     #[test]
     fn or_after_export_clears_accumulated_env() {
+        clear_git_env();
         // export A=1 && echo ok || export B=2 && git push
         // The || clears accumulated env (conservative: can't determine which
         // path was taken). git push doesn't see GIT_CONFIG_GLOBAL.
@@ -839,6 +852,7 @@ mod tests {
 
     #[test]
     fn unset_removes_accumulated_var() {
+        clear_git_env();
         let reg = registry_with_git_env_gate();
         let result = reg.evaluate(
             "export GIT_CONFIG_GLOBAL=~/.gitconfig.ai ; unset GIT_CONFIG_GLOBAL ; git push origin main",
@@ -916,6 +930,7 @@ mod tests {
 
     #[test]
     fn env_i_clears_accumulated_env_for_wrapped_cmd() {
+        clear_git_env();
         let reg = registry_with_git_env_gate();
         let result =
             reg.evaluate("export GIT_CONFIG_GLOBAL=~/.gitconfig.ai ; env -i git push origin main");
@@ -924,6 +939,7 @@ mod tests {
 
     #[test]
     fn env_dash_clears_accumulated_env_for_wrapped_cmd() {
+        clear_git_env();
         let reg = registry_with_git_env_gate();
         let result =
             reg.evaluate("export GIT_CONFIG_GLOBAL=~/.gitconfig.ai ; env - git push origin main");

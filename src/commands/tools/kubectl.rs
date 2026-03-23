@@ -114,6 +114,16 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
+    /// Clear `KUBECONFIG` from the process environment so the env-gate
+    /// fallback in `env_satisfies` doesn't interfere.  Requires nextest.
+    fn clear_kubectl_env() {
+        assert!(
+            std::env::var("NEXTEST").is_ok(),
+            "this test mutates process env and requires nextest (cargo nextest run)"
+        );
+        unsafe { std::env::remove_var("KUBECONFIG") };
+    }
+
     fn spec() -> KubectlSpec {
         KubectlSpec::from_config(&Config::default_config().kubectl)
     }
@@ -189,6 +199,7 @@ mod tests {
 
     #[test]
     fn env_gate_apply_no_config() {
+        clear_kubectl_env();
         assert_eq!(
             eval_with_env_gate("kubectl apply -f deploy.yaml"),
             Decision::Ask

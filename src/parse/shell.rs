@@ -323,6 +323,28 @@ impl WalkResult {
 /// 3. **Control flow nodes** (`for_statement`, `if_statement`, etc.) — recurse
 ///    into their body to extract the actual commands.
 ///
+/// Apply a wrapping redirection to segments from a compound body.
+///
+/// For `list` nodes (`&&`/`||`/`;` chains) only the last segment receives the
+/// redirect — earlier segments are independent commands whose output is not
+/// redirected.  For control-flow bodies (`for`/`while`/`if`/`case`) every
+/// segment is wrapped by the construct, so all receive the redirect.
+fn propagate_redirect(result: &mut WalkResult, node_kind: &str, redir: &Redirection) {
+    if node_kind == "list" {
+        if let Some(last) = result.segments.last_mut()
+            && last.redirection.is_none()
+        {
+            last.redirection = Some(redir.clone());
+        }
+    } else {
+        for seg in &mut result.segments {
+            if seg.redirection.is_none() {
+                seg.redirection = Some(redir.clone());
+            }
+        }
+    }
+}
+
 /// Unknown named nodes are treated as single segments (conservative: the eval
 /// layer will flag them as unrecognized → ASK).
 fn walk_ast(node: Node, source: &[u8]) -> WalkResult {
@@ -468,11 +490,7 @@ fn walk_redirected(node: Node, source: &[u8]) -> WalkResult {
                         // extract inner commands instead of flattening.
                         let mut body = walk_ast(sib, source);
                         if let Some(ref r) = redir {
-                            for seg in &mut body.segments {
-                                if seg.redirection.is_none() {
-                                    seg.redirection = Some(r.clone());
-                                }
-                            }
+                            propagate_redirect(&mut body, sib.kind(), r);
                         }
                         full.append(body, None);
                     }
@@ -500,14 +518,14 @@ fn walk_redirected(node: Node, source: &[u8]) -> WalkResult {
             let end = effective_end(node);
             return WalkResult::single(node.start_byte(), end, redir);
         }
-        // Compound body (e.g. for loop with redirect).
+        // Compound body with redirect.  For list nodes (&&/||/; chains) only
+        // the last segment gets the redirect — the earlier segments are
+        // independent commands whose output is not redirected.  For
+        // control-flow bodies (for/while/if/case) every inner segment is
+        // wrapped by the construct and therefore all receive the redirect.
         let mut result = walk_ast(child, source);
         if let Some(ref r) = redir {
-            for seg in &mut result.segments {
-                if seg.redirection.is_none() {
-                    seg.redirection = Some(r.clone());
-                }
-            }
+            propagate_redirect(&mut result, child.kind(), r);
         }
         return result;
     }
@@ -1203,6 +1221,145 @@ mod tests {
         assert!(
             p.segments.iter().any(|s| s.command.trim() == "cat"),
             "expected piped 'cat' segment: {commands:?}",
+        );
+    }
+
+    // --- Redirection propagation (list vs. control-flow) ---
+
+    #[test]
+    fn redirect_list_only_last_segment_gets_redir() {
+        // `export FOO=bar && cat > /tmp/file` — only the last segment (cat)
+        // should carry the redirection; the export segment must not.
+        let (p, _) = parse_with_substitutions("export FOO=bar && cat > /tmp/file");
+        assert_eq!(p.segments.len(), 2, "expected 2 segments: {:?}", p.segments);
+        assert!(
+            p.segments[0].redirection.is_none(),
+            "export segment must NOT carry redirection: {:?}",
+            p.segments[0],
+        );
+        assert!(
+            p.segments[1].redirection.is_some(),
+            "cat segment must carry redirection: {:?}",
+            p.segments[1],
+        );
+    }
+
+    #[test]
+    fn redirect_for_loop_all_segments_get_redir() {
+        // `for i in *; do echo $i; done > /tmp/out` — the loop body is a
+        // control-flow construct, so all inner segments get the redirect.
+        let (p, _) = parse_with_substitutions("for i in *; do echo $i; done > /tmp/out");
+        assert!(
+            !p.segments.is_empty(),
+            "expected at least one segment from loop body"
+        );
+        assert!(
+            p.segments.iter().all(|s| s.redirection.is_some()),
+            "all loop-body segments must carry the redirection: {:?}",
+            p.segments,
+        );
+    }
+
+    #[test]
+    fn redirect_list_three_segments_only_last_gets_redir() {
+        // `a && b && c > file` — 3 segments, only the last should have a redirect.
+        let (p, _) = parse_with_substitutions("a && b && c > file");
+        assert_eq!(p.segments.len(), 3, "expected 3 segments: {:?}", p.segments);
+        assert!(
+            p.segments[0].redirection.is_none(),
+            "segment 0 must NOT carry redirection: {:?}",
+            p.segments[0],
+        );
+        assert!(
+            p.segments[1].redirection.is_none(),
+            "segment 1 must NOT carry redirection: {:?}",
+            p.segments[1],
+        );
+        assert!(
+            p.segments[2].redirection.is_some(),
+            "segment 2 must carry redirection: {:?}",
+            p.segments[2],
+        );
+    }
+
+    #[test]
+    fn redirect_list_original_bug_scenario() {
+        // Original bug: `export FOO=bar && REPO_ID=$(echo test) && cat > /tmp/file`
+        // produced 3 segments where export and assignment both had redirection,
+        // causing them to be incorrectly escalated to Ask.
+        // Only the last segment (cat) must carry the redirect.
+        let (p, _) =
+            parse_with_substitutions("export FOO=bar && REPO_ID=$(echo test) && cat > /tmp/file");
+        assert_eq!(p.segments.len(), 3, "expected 3 segments: {:?}", p.segments);
+        assert!(
+            p.segments[0].redirection.is_none(),
+            "export segment must NOT carry redirection: {:?}",
+            p.segments[0],
+        );
+        assert!(
+            p.segments[1].redirection.is_none(),
+            "assignment segment must NOT carry redirection: {:?}",
+            p.segments[1],
+        );
+        assert!(
+            p.segments[2].redirection.is_some(),
+            "cat segment must carry redirection: {:?}",
+            p.segments[2],
+        );
+    }
+
+    #[test]
+    fn redirect_or_list_only_last_segment_gets_redir() {
+        // `a || b > file` — || chains are also `list` nodes; only last gets redirect.
+        let (p, _) = parse_with_substitutions("a || b > file");
+        assert_eq!(p.segments.len(), 2, "expected 2 segments: {:?}", p.segments);
+        assert!(
+            p.segments[0].redirection.is_none(),
+            "first segment must NOT carry redirection: {:?}",
+            p.segments[0],
+        );
+        assert!(
+            p.segments[1].redirection.is_some(),
+            "last segment must carry redirection: {:?}",
+            p.segments[1],
+        );
+    }
+
+    #[test]
+    fn redirect_mixed_operators_only_last_gets_redir() {
+        // `a && b || c > file` — mixed &&/|| chain, only last gets redirect.
+        let (p, _) = parse_with_substitutions("a && b || c > file");
+        assert_eq!(p.segments.len(), 3, "expected 3 segments: {:?}", p.segments);
+        assert!(
+            p.segments[0].redirection.is_none(),
+            "segment 0 must NOT carry redirection: {:?}",
+            p.segments[0],
+        );
+        assert!(
+            p.segments[1].redirection.is_none(),
+            "segment 1 must NOT carry redirection: {:?}",
+            p.segments[1],
+        );
+        assert!(
+            p.segments[2].redirection.is_some(),
+            "last segment must carry redirection: {:?}",
+            p.segments[2],
+        );
+    }
+
+    #[test]
+    fn redirect_compound_statement_all_segments_get_redir() {
+        // `{ a && b; } > /tmp/out` — compound_statement wrapping a list; the
+        // redirect applies to the entire group, so ALL segments must carry it.
+        let (p, _) = parse_with_substitutions("{ a && b; } > /tmp/out");
+        assert!(
+            !p.segments.is_empty(),
+            "expected at least one segment from compound body"
+        );
+        assert!(
+            p.segments.iter().all(|s| s.redirection.is_some()),
+            "all segments in grouped command must carry redirect: {:?}",
+            p.segments,
         );
     }
 }

@@ -159,6 +159,17 @@ mod tests {
     use super::*;
     use crate::config::{Config, GitConfig};
 
+    /// Clear `GIT_CONFIG_GLOBAL` from the process environment so the
+    /// env-gate fallback in `env_satisfies` doesn't interfere with tests
+    /// that assert "no config → Ask".  Requires nextest (process-per-test).
+    fn clear_git_env() {
+        assert!(
+            std::env::var("NEXTEST").is_ok(),
+            "this test mutates process env and requires nextest (cargo nextest run)"
+        );
+        unsafe { std::env::remove_var("GIT_CONFIG_GLOBAL") };
+    }
+
     fn default_spec() -> GitSpec {
         GitSpec::from_config(&Config::default_config().git)
     }
@@ -251,6 +262,7 @@ mod tests {
 
     #[test]
     fn env_gate_push_no_config() {
+        clear_git_env();
         assert_eq!(eval_with_env_gate("git push origin main"), Decision::Ask);
     }
 
