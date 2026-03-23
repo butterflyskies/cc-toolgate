@@ -4,6 +4,11 @@ version = "0.6.0"
 edition = "2024"
 description = "PreToolUse hook for Claude Code that gates Bash commands with compound-command-aware validation"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/butterflyskies/cc-toolgate"
+readme = "README.md"
+keywords = ["claude-code", "hooks", "security", "shell", "toolgate"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.88"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
