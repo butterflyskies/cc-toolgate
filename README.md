@@ -239,17 +239,12 @@ Commands in the `[wrappers]` section execute their arguments as subcommands. Eac
 
 ### Running tests
 
-```bash
-cargo test              # Run all tests
-cargo test --lib        # Unit tests only
-cargo test --test integration  # Integration tests only
-```
-
-[cargo-nextest](https://nexte.st/) is recommended for faster parallel execution and better output:
+Requires [cargo-nextest](https://nexte.st/) (process-per-test isolation needed for env-gate tests):
 
 ```bash
-cargo nextest run       # All tests
-cargo nextest run -E 'test(heredoc)'  # Filter by name pattern
+cargo nextest run                       # All tests
+cargo nextest run -E 'test(heredoc)'    # Filter by name pattern
+cargo nextest run --test integration    # Integration tests only
 ```
 
 ### Test structure
