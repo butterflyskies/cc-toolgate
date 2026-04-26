@@ -116,21 +116,25 @@ impl CommandSpec for GitSpec {
                 return RuleMatch {
                     decision: Decision::Ask,
                     reason: "git force-push requires confirmation".into(),
+                    matched: true,
                 };
             }
         }
 
         // Try two-word subcommand first (e.g. "town hack"), fall back to one-word
-        // (e.g. "town") if the two-word form isn't recognized. Same probe pattern
-        // as the gh evaluator — see that module for the rationale.
+        // (e.g. "town") only if the two-word form was unrecognized. If the two-word
+        // form explicitly matched any list (including mutating), that's authoritative
+        // — the one-word fallback must not override it.
         if !sub_two.is_empty() {
             let two_result = self.matcher.evaluate(ctx, "git", &sub_two);
             if two_result.decision == Decision::Allow {
                 return two_result;
             }
-            let one_result = self.matcher.evaluate(ctx, "git", &sub_one);
-            if one_result.decision == Decision::Allow {
-                return one_result;
+            if !two_result.matched {
+                let one_result = self.matcher.evaluate(ctx, "git", &sub_one);
+                if one_result.decision == Decision::Allow {
+                    return one_result;
+                }
             }
             return two_result;
         }

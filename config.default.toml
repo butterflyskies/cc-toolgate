@@ -113,6 +113,8 @@ read_only = [
     "fetch",
     # --version: treated as a subcommand by the extractor (git --version has no subcommand word)
     "--version",
+    # git-town: bare `git town` shows help
+    "town",
     # git-town: informational / read-only
     "town branch", "town config", "town diff-parent", "town help",
     "town status", "town runlog", "town completions", "town offline",
@@ -131,7 +133,12 @@ allow = [
 
 # Mutating operations — always ask.
 mutating = [
+    # git-town: remote-affecting
     "town sync", "town ship", "town propose", "town delete", "town repo",
+    # destructive stash/remote operations (one-word prefixes are in read_only,
+    # but the two-word match takes precedence when matched)
+    "stash drop", "stash clear",
+    "remote add", "remote remove", "remote rename", "remote set-url",
 ]
 
 # Subcommands auto-allowed only when all config_env entries match.

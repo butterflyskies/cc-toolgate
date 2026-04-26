@@ -40,22 +40,36 @@ impl GhSpec {
         }
     }
 
-    /// Get the two-word subcommand (e.g. "pr list") and one-word fallback ("pr").
-    /// Handles env var prefixes like `GH_TOKEN=abc gh pr create`.
-    fn subcommands(ctx: &CommandContext) -> (String, String) {
-        let gh_pos = ctx.words.iter().position(|w| w == "gh");
-        let after_gh = gh_pos.map(|p| p + 1).unwrap_or(1);
+    /// Global gh flags that consume the next word as their argument.
+    const GLOBAL_ARG_FLAGS: &[&str] = &["--hostname", "-R", "--repo"];
 
-        let sub_two = if ctx.words.len() > after_gh + 1 {
-            format!("{} {}", ctx.words[after_gh], ctx.words[after_gh + 1])
-        } else {
-            String::new()
+    /// Extract subcommands, skipping global flags.
+    /// Returns `(two_word, one_word)` like `("pr list", "pr")`.
+    fn subcommands(ctx: &CommandContext) -> (String, String) {
+        let mut iter = ctx.words.iter();
+        for word in iter.by_ref() {
+            if word == "gh" {
+                break;
+            }
+        }
+        let sub_one = loop {
+            let word = match iter.next() {
+                Some(w) => w,
+                None => return (String::new(), "?".into()),
+            };
+            if Self::GLOBAL_ARG_FLAGS.contains(&word.as_str()) {
+                iter.next();
+                continue;
+            }
+            if word.starts_with('-') {
+                continue;
+            }
+            break word.clone();
         };
-        let sub_one = ctx
-            .words
-            .get(after_gh)
-            .cloned()
-            .unwrap_or_else(|| "?".to_string());
+        let sub_two = iter
+            .find(|w| !w.starts_with('-'))
+            .map(|w| format!("{sub_one} {w}"))
+            .unwrap_or_default();
         (sub_two, sub_one)
     }
 }
@@ -69,38 +83,27 @@ impl CommandSpec for GhSpec {
             return RuleMatch {
                 decision: Decision::Allow,
                 reason: "gh --version".into(),
+                matched: true,
             };
         }
 
         let (sub_two, sub_one) = Self::subcommands(ctx);
 
-        // Try the two-word subcommand first. If it's recognized (ALLOW or a
-        // config-driven ASK), use that result. If it falls through as an
-        // unrecognized subcommand, try the one-word fallback — this handles
-        // one-word commands like `gh status` that aren't two-word forms.
-        //
-        // TODO(review): this "try two then one" probe has a subtle edge: if
-        // sub_two is empty (e.g. bare `gh`), sub_one becomes "?" and both
-        // return "requires confirmation". That's correct behavior — bare `gh`
-        // should ask. But if gh gains a recognized one-word command that also
-        // appears as the first word of a two-word form (e.g. `gh status` and
-        // `gh status refresh`), the two-word probe fires first, which is right.
+        // Try two-word first, fall back to one-word only if unrecognized.
         if !sub_two.is_empty() {
             let two_result = self.matcher.evaluate(ctx, "gh", &sub_two);
             if two_result.decision == Decision::Allow {
                 return two_result;
             }
-            // Two-word fell through (unrecognized) — try one-word fallback.
-            // If the one-word form is recognized as ALLOW, use it.
-            // Otherwise keep the two-word reason (more informative).
-            let one_result = self.matcher.evaluate(ctx, "gh", &sub_one);
-            if one_result.decision == Decision::Allow {
-                return one_result;
+            if !two_result.matched {
+                let one_result = self.matcher.evaluate(ctx, "gh", &sub_one);
+                if one_result.decision == Decision::Allow {
+                    return one_result;
+                }
             }
             return two_result;
         }
 
-        // No two-word form available — evaluate the one-word subcommand directly.
         self.matcher.evaluate(ctx, "gh", &sub_one)
     }
 }

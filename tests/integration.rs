@@ -702,6 +702,33 @@ decision_test!(ask_git_town_repo, "git town repo", Ask);
 
 decision_test!(allow_git_fetch, "git fetch origin", Allow);
 
+// ── two-word mutating overrides one-word read_only ──
+
+decision_test!(ask_stash_drop, "git stash drop", Ask);
+decision_test!(ask_stash_clear, "git stash clear", Ask);
+decision_test!(allow_stash_bare, "git stash", Allow);
+decision_test!(
+    ask_remote_add,
+    "git remote add upstream https://example.com",
+    Ask
+);
+decision_test!(ask_remote_remove, "git remote remove upstream", Ask);
+decision_test!(allow_remote_bare, "git remote", Allow);
+decision_test!(allow_git_town_bare, "git town", Allow);
+
+// ── gh global flag skipping ──
+
+decision_test!(
+    allow_gh_hostname_pr_list,
+    "gh --hostname github.com pr list",
+    Allow
+);
+decision_test!(
+    allow_gh_repo_flag_pr_view,
+    "gh -R owner/repo pr view 123",
+    Allow
+);
+
 // ── Pipeline redirection propagation (issue #37) ──
 
 decision_test!(

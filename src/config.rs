@@ -264,6 +264,8 @@ struct GitOverlay {
     allowed_with_config: Vec<String>,
     config_env: Option<HashMap<String, String>>,
     #[serde(default)]
+    remove_config_env: Vec<String>,
+    #[serde(default)]
     force_push_flags: Vec<String>,
     #[serde(default)]
     remove_read_only: Vec<String>,
@@ -291,6 +293,8 @@ struct CargoOverlay {
     allowed_with_config: Vec<String>,
     config_env: Option<HashMap<String, String>>,
     #[serde(default)]
+    remove_config_env: Vec<String>,
+    #[serde(default)]
     remove_safe_subcommands: Vec<String>,
     #[serde(default)]
     remove_read_only: Vec<String>,
@@ -314,6 +318,8 @@ struct KubectlOverlay {
     allowed_with_config: Vec<String>,
     config_env: Option<HashMap<String, String>>,
     #[serde(default)]
+    remove_config_env: Vec<String>,
+    #[serde(default)]
     remove_read_only: Vec<String>,
     #[serde(default)]
     remove_allow: Vec<String>,
@@ -336,6 +342,8 @@ struct GhOverlay {
     #[serde(default)]
     allowed_with_config: Vec<String>,
     config_env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    remove_config_env: Vec<String>,
     #[serde(default)]
     remove_read_only: Vec<String>,
     #[serde(default)]
@@ -477,8 +485,16 @@ impl Config {
             &g.remove_force_push_flags,
             g.replace,
         );
+        for key in &g.remove_config_env {
+            self.git.config_env.remove(key);
+        }
         if let Some(v) = g.config_env {
-            self.git.config_env = v;
+            self.git.config_env.extend(v);
+        }
+        if self.git.force_push_flags.is_empty() {
+            eprintln!(
+                "cc-toolgate: warning: git.force_push_flags is empty — force-push detection disabled"
+            );
         }
 
         // Cargo
@@ -507,8 +523,11 @@ impl Config {
             &ca.remove_allowed_with_config,
             ca.replace,
         );
+        for key in &ca.remove_config_env {
+            self.cargo.config_env.remove(key);
+        }
         if let Some(v) = ca.config_env {
-            self.cargo.config_env = v;
+            self.cargo.config_env.extend(v);
         }
 
         // Kubectl
@@ -532,8 +551,11 @@ impl Config {
             &k.remove_allowed_with_config,
             k.replace,
         );
+        for key in &k.remove_config_env {
+            self.kubectl.config_env.remove(key);
+        }
         if let Some(v) = k.config_env {
-            self.kubectl.config_env = v;
+            self.kubectl.config_env.extend(v);
         }
 
         // Gh
@@ -557,8 +579,11 @@ impl Config {
             &gh.remove_allowed_with_config,
             gh.replace,
         );
+        for key in &gh.remove_config_env {
+            self.gh.config_env.remove(key);
+        }
         if let Some(v) = gh.config_env {
-            self.gh.config_env = v;
+            self.gh.config_env.extend(v);
         }
     }
 
@@ -922,10 +947,16 @@ mod tests {
             r#"
             [git]
             allowed_with_config = ["push"]
-            config_env_var = "GIT_CONFIG_GLOBAL"
+            [git.config_env]
+            GIT_CONFIG_GLOBAL = "~/.gitconfig.ai"
         "#,
         );
         assert_eq!(config.kubectl.read_only, original_kubectl_read_only);
+        assert_eq!(config.git.allowed_with_config, vec!["push"]);
+        assert_eq!(
+            config.git.config_env.get("GIT_CONFIG_GLOBAL").unwrap(),
+            "~/.gitconfig.ai"
+        );
     }
 
     #[test]

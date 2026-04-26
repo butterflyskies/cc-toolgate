@@ -319,6 +319,7 @@ impl CommandRegistry {
             return RuleMatch {
                 decision: Decision::Allow,
                 reason: "empty".into(),
+                matched: true,
             };
         }
 
@@ -328,6 +329,7 @@ impl CommandRegistry {
             return RuleMatch {
                 decision: Decision::Allow,
                 reason: format!("variable assignment: {}", words[0]),
+                matched: true,
             };
         }
 
@@ -362,6 +364,7 @@ impl CommandRegistry {
             return self.maybe_escalate(RuleMatch {
                 decision: strictest,
                 reason,
+                matched: true,
             });
         }
 
@@ -382,6 +385,7 @@ impl CommandRegistry {
         RuleMatch {
             decision: Decision::Ask,
             reason: format!("unrecognized command: {}", ctx.base_command),
+            matched: false,
         }
     }
 
@@ -506,6 +510,7 @@ impl CommandRegistry {
         self.maybe_annotate_project_overlay(RuleMatch {
             decision: strictest,
             reason: format!("{}:\n{}", header, reasons.join("\n")),
+            matched: true,
         })
     }
 }

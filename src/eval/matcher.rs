@@ -44,6 +44,23 @@ impl SubcommandMatcher {
         allowed_with_config: Vec<String>,
         config_env: HashMap<String, String>,
     ) -> Self {
+        let lists: [(&[String], &str); 4] = [
+            (&read_only, "read_only"),
+            (&allow, "allow"),
+            (&mutating, "mutating"),
+            (&allowed_with_config, "allowed_with_config"),
+        ];
+        for (i, (list_a, name_a)) in lists.iter().enumerate() {
+            for (list_b, name_b) in &lists[i + 1..] {
+                for item in list_a.iter() {
+                    if list_b.contains(item) {
+                        log::warn!(
+                            "subcommand \"{item}\" in both {name_a} and {name_b} — {name_a} takes precedence"
+                        );
+                    }
+                }
+            }
+        }
         Self {
             read_only,
             allow,
@@ -80,11 +97,13 @@ impl SubcommandMatcher {
                 return RuleMatch {
                     decision: Decision::Ask,
                     reason: format!("{tool} {sub} with {}", r.description),
+                    matched: true,
                 };
             }
             return RuleMatch {
                 decision: Decision::Allow,
                 reason: format!("read-only {tool} {sub}"),
+                matched: true,
             };
         }
 
@@ -94,11 +113,13 @@ impl SubcommandMatcher {
                 return RuleMatch {
                     decision: Decision::Ask,
                     reason: format!("{tool} {sub} with {}", r.description),
+                    matched: true,
                 };
             }
             return RuleMatch {
                 decision: Decision::Allow,
                 reason: format!("allowed: {tool} {sub}"),
+                matched: true,
             };
         }
 
@@ -109,16 +130,19 @@ impl SubcommandMatcher {
                     return RuleMatch {
                         decision: Decision::Ask,
                         reason: format!("{tool} {sub} with {}", r.description),
+                        matched: true,
                     };
                 }
                 return RuleMatch {
                     decision: Decision::Allow,
                     reason: format!("{tool} {sub} with {}", self.env_keys_display()),
+                    matched: true,
                 };
             }
             return RuleMatch {
                 decision: Decision::Ask,
                 reason: format!("{tool} {sub} requires confirmation"),
+                matched: true,
             };
         }
 
@@ -127,6 +151,7 @@ impl SubcommandMatcher {
             return RuleMatch {
                 decision: Decision::Ask,
                 reason: format!("{tool} {sub} requires confirmation"),
+                matched: true,
             };
         }
 
@@ -134,6 +159,7 @@ impl SubcommandMatcher {
         RuleMatch {
             decision: Decision::Ask,
             reason: format!("{tool} {sub} requires confirmation"),
+            matched: false,
         }
     }
 }

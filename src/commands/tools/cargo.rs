@@ -74,6 +74,7 @@ impl CommandSpec for CargoSpec {
             return RuleMatch {
                 decision: Decision::Allow,
                 reason: "cargo --version".into(),
+                matched: true,
             };
         }
 
