@@ -2,6 +2,32 @@
 
 use crate::parse::Redirection;
 
+/// Compare a command env var value against a config value (raw and shell-expanded forms).
+///
+/// Tries three strategies in order:
+/// 1. Exact raw match (`cmd_val == config_raw`)
+/// 2. Expanded match (`cmd_val == config_expanded`)
+/// 3. Canonicalization fallback: shell-expand `cmd_val`, then `std::fs::canonicalize` both
+fn paths_match(cmd_val: &str, config_raw: &str, config_expanded: &str) -> bool {
+    // 1. Raw match
+    if cmd_val == config_raw {
+        return true;
+    }
+    // 2. Expanded match
+    if cmd_val == config_expanded {
+        return true;
+    }
+    // 3. Canonicalization fallback: expand cmd_val too, canonicalize both
+    let cmd_expanded = shellexpand::full(cmd_val).unwrap_or(std::borrow::Cow::Borrowed(cmd_val));
+    if let (Ok(cc), Ok(ce)) = (
+        std::fs::canonicalize(cmd_expanded.as_ref()),
+        std::fs::canonicalize(config_expanded),
+    ) {
+        return cc == ce;
+    }
+    false
+}
+
 /// Context for evaluating a single command segment.
 #[derive(Debug)]
 pub struct CommandContext<'a> {
@@ -58,14 +84,14 @@ impl<'a> CommandContext<'a> {
             };
             // Check inline env vars first (may contain literal ~ or expanded path)
             if let Some((_, v)) = self.env_vars.iter().find(|(k, _)| k == key) {
-                return v == value || v == expanded.as_ref();
+                return paths_match(v, value, expanded.as_ref());
             }
             // Check accumulated env from prior compound-command segments
             if let Some(v) = self.accumulated_env.get(key) {
-                return v == value || v == expanded.as_ref();
+                return paths_match(v, value, expanded.as_ref());
             }
             // Fall back to process environment (shell will have expanded already)
-            std::env::var(key).is_ok_and(|v| v == *value || v == expanded.as_ref())
+            std::env::var(key).is_ok_and(|v| paths_match(&v, value, expanded.as_ref()))
         })
     }
 
@@ -249,5 +275,46 @@ mod tests {
         let req = HashMap::from([(COLLISION_KEY.into(), "beta".into())]);
         assert!(ctx.env_satisfies(&req), "expected 'beta', env was tampered");
         unsafe { std::env::remove_var(COLLISION_KEY) };
+    }
+
+    #[test]
+    fn env_satisfies_symlink_canonicalization() {
+        require_nextest();
+
+        // Create a real temp dir and a symlink dir pointing to it
+        let base = std::env::temp_dir().join("cc_toolgate_symlink_test_env_satisfies");
+        let real_dir = base.join("real");
+        let link_dir = base.join("link");
+
+        std::fs::create_dir_all(&real_dir).unwrap();
+        // Remove stale symlink if it exists
+        let _ = std::fs::remove_file(&link_dir);
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+        std::fs::write(real_dir.join("marker"), b"x").unwrap();
+
+        let real_str = real_dir.to_str().unwrap();
+        let link_str = link_dir.to_str().unwrap();
+
+        // Case 1: command uses symlink path, config has real/canonical path
+        let cmd1 = format!("MY_PATH={link_str} git push");
+        let ctx1 = CommandContext::from_command(&cmd1);
+        let req1 = HashMap::from([("MY_PATH".into(), real_str.to_string())]);
+        assert!(
+            ctx1.env_satisfies(&req1),
+            "symlink path in command should match canonical config path"
+        );
+
+        // Case 2: command uses real path, config has symlink path
+        let cmd2 = format!("MY_PATH={real_str} git push");
+        let ctx2 = CommandContext::from_command(&cmd2);
+        let req2 = HashMap::from([("MY_PATH".into(), link_str.to_string())]);
+        assert!(
+            ctx2.env_satisfies(&req2),
+            "real path in command should match symlink config path (canonicalized)"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_file(&link_dir);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

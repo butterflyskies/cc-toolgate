@@ -1,8 +1,9 @@
 //! Subcommand-aware evaluators for specific CLI tools.
 //!
-//! Each module implements `CommandSpec` with tool-specific
-//! logic: subcommand extraction, read-only vs mutating classification,
-//! env-gated auto-allow, and redirection escalation.
+//! Each module implements `CommandSpec` with tool-specific logic: subcommand
+//! extraction, read-only vs mutating classification, env-gated auto-allow,
+//! and redirection escalation. The shared evaluation pipeline lives in
+//! `crate::eval::matcher::SubcommandMatcher`.
 
 /// Subcommand-aware cargo evaluation (build → allow, install → ask, etc.).
 pub mod cargo;

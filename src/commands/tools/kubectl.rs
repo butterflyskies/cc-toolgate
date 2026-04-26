@@ -6,35 +6,32 @@
 
 use super::super::CommandSpec;
 use crate::config::KubectlConfig;
-use crate::eval::{CommandContext, Decision, RuleMatch};
-use std::collections::HashMap;
+use crate::eval::matcher::SubcommandMatcher;
+use crate::eval::{CommandContext, RuleMatch};
 
 /// Subcommand-aware kubectl evaluator.
 ///
 /// Evaluation order:
 /// 1. Read-only subcommands → ALLOW (with redirection escalation)
-/// 2. Env-gated subcommands → ALLOW if all `config_env` entries match, else ASK
-/// 3. Known mutating subcommands → ASK
-/// 4. Everything else → ASK
+/// 2. Unconditionally-allowed subcommands → ALLOW (with redirection escalation)
+/// 3. Env-gated subcommands → ALLOW if all `config_env` entries match, else ASK
+/// 4. Known mutating subcommands → ASK
+/// 5. Everything else → ASK
 pub struct KubectlSpec {
-    /// Subcommands that are always allowed (e.g. `get`, `describe`, `logs`).
-    read_only: Vec<String>,
-    /// Known mutating subcommands that always require confirmation.
-    mutating: Vec<String>,
-    /// Subcommands allowed only when all `config_env` entries match.
-    allowed_with_config: Vec<String>,
-    /// Required env var name→value pairs that gate `allowed_with_config` subcommands.
-    config_env: HashMap<String, String>,
+    matcher: SubcommandMatcher,
 }
 
 impl KubectlSpec {
     /// Build a kubectl spec from configuration.
     pub fn from_config(config: &KubectlConfig) -> Self {
         Self {
-            read_only: config.read_only.clone(),
-            mutating: config.mutating.clone(),
-            allowed_with_config: config.allowed_with_config.clone(),
-            config_env: config.config_env.clone(),
+            matcher: SubcommandMatcher::new(
+                config.read_only.clone(),
+                config.allow.clone(),
+                config.mutating.clone(),
+                config.allowed_with_config.clone(),
+                config.config_env.clone(),
+            ),
         }
     }
 
@@ -49,70 +46,21 @@ impl KubectlSpec {
         }
         None
     }
-
-    /// Format config_env keys for reason strings.
-    fn env_keys_display(&self) -> String {
-        let mut keys: Vec<&str> = self.config_env.keys().map(|k| k.as_str()).collect();
-        keys.sort();
-        keys.join(", ")
-    }
 }
 
 impl CommandSpec for KubectlSpec {
     fn evaluate(&self, ctx: &CommandContext) -> RuleMatch {
-        let sub_str = Self::subcommand(ctx).unwrap_or("?");
-
-        if self.read_only.iter().any(|s| s == sub_str) {
-            if let Some(ref r) = ctx.redirection {
-                return RuleMatch {
-                    decision: Decision::Ask,
-                    reason: format!("kubectl {sub_str} with {}", r.description),
-                };
-            }
-            return RuleMatch {
-                decision: Decision::Allow,
-                reason: format!("read-only kubectl {sub_str}"),
-            };
-        }
-
-        // Env-gated subcommands: allowed only when all config_env entries match
-        if self.allowed_with_config.iter().any(|s| s == sub_str) {
-            if !self.config_env.is_empty() && ctx.env_satisfies(&self.config_env) {
-                if let Some(ref r) = ctx.redirection {
-                    return RuleMatch {
-                        decision: Decision::Ask,
-                        reason: format!("kubectl {sub_str} with {}", r.description),
-                    };
-                }
-                return RuleMatch {
-                    decision: Decision::Allow,
-                    reason: format!("kubectl {sub_str} with {}", self.env_keys_display()),
-                };
-            }
-            return RuleMatch {
-                decision: Decision::Ask,
-                reason: format!("kubectl {sub_str} requires confirmation"),
-            };
-        }
-
-        if self.mutating.iter().any(|s| s == sub_str) {
-            return RuleMatch {
-                decision: Decision::Ask,
-                reason: format!("kubectl {sub_str} requires confirmation"),
-            };
-        }
-
-        RuleMatch {
-            decision: Decision::Ask,
-            reason: format!("kubectl {sub_str} requires confirmation"),
-        }
+        let sub = Self::subcommand(ctx).unwrap_or("?");
+        self.matcher.evaluate(ctx, "kubectl", sub)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, KubectlConfig};
+    use crate::eval::{CommandContext, Decision};
+    use std::collections::HashMap;
 
     /// Clear `KUBECONFIG` from the process environment so the env-gate
     /// fallback in `env_satisfies` doesn't interfere.  Requires nextest.
@@ -169,6 +117,7 @@ mod tests {
     fn spec_with_env_gate() -> KubectlSpec {
         KubectlSpec::from_config(&KubectlConfig {
             read_only: vec!["get".into(), "describe".into()],
+            allow: vec![],
             mutating: vec!["delete".into()],
             allowed_with_config: vec!["apply".into(), "rollout".into()],
             config_env: HashMap::from([("KUBECONFIG".into(), "~/.kube/config.ai".into())]),

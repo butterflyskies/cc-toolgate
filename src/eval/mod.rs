@@ -9,6 +9,8 @@
 pub mod context;
 /// Decision enum and rule match types.
 pub mod decision;
+/// Data-driven subcommand matcher shared by all tool evaluators.
+pub(crate) mod matcher;
 
 pub use context::CommandContext;
 pub use decision::{Decision, RuleMatch};

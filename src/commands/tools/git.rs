@@ -6,24 +6,27 @@
 
 use super::super::CommandSpec;
 use crate::config::GitConfig;
+use crate::eval::matcher::SubcommandMatcher;
 use crate::eval::{CommandContext, Decision, RuleMatch};
-use std::collections::HashMap;
 
 /// Subcommand-aware git evaluator.
 ///
 /// Evaluation order:
-/// 1. Force-push flags → always ASK
-/// 2. Read-only subcommands → ALLOW (with redirection escalation)
-/// 3. Env-gated subcommands → ALLOW if all `config_env` entries match, else ASK
-/// 4. `--version` → ALLOW
-/// 5. Everything else → ASK
+/// 1. Force-push flags on `push` → always ASK
+/// 2. Read-only subcommands → ALLOW (redirection escalates to ASK)
+/// 3. Unconditionally-allowed subcommands → ALLOW (redirection escalates to ASK)
+/// 4. Env-gated subcommands → ALLOW if all `config_env` entries match, else ASK
+/// 5. Explicitly mutating subcommands → ASK
+/// 6. Everything else → ASK
+///
+/// `--version` lives in `read_only` (in config), so `git --version` is
+/// handled by step 2. Redirection on `git --version > file` escalates to
+/// ASK, which is correct behavior.
+// TODO(review): --version moved from post-pipeline special case to config.read_only.
+// The old check had `words.len() <= 3` guard; read_only has no such guard, but
+// `git --version --extra-arg` is harmless to allow. Revisit if that matters.
 pub struct GitSpec {
-    /// Git subcommands that are always allowed (e.g. `status`, `log`, `diff`).
-    read_only: Vec<String>,
-    /// Subcommands allowed only when all `config_env` entries match.
-    allowed_with_config: Vec<String>,
-    /// Required env var name→value pairs that gate `allowed_with_config` subcommands.
-    config_env: HashMap<String, String>,
+    matcher: SubcommandMatcher,
     /// Flags indicating force-push (always ASK regardless of env-gating).
     force_push_flags: Vec<String>,
 }
@@ -32,9 +35,13 @@ impl GitSpec {
     /// Build a git spec from configuration.
     pub fn from_config(config: &GitConfig) -> Self {
         Self {
-            read_only: config.read_only.clone(),
-            allowed_with_config: config.allowed_with_config.clone(),
-            config_env: config.config_env.clone(),
+            matcher: SubcommandMatcher::new(
+                config.read_only.clone(),
+                config.allow.clone(),
+                config.mutating.clone(),
+                config.allowed_with_config.clone(),
+                config.config_env.clone(),
+            ),
             force_push_flags: config.force_push_flags.clone(),
         }
     }
@@ -55,9 +62,18 @@ impl GitSpec {
         "--no-optional-locks",
     ];
 
-    /// Extract the git subcommand word (e.g. "push" from "git push origin main").
+    /// Extract the git subcommand, returning both a two-word form and one-word form.
+    ///
+    /// Returns `(two_word, one_word)` where `two_word` is `"<sub> <next>"` (e.g.
+    /// `"town hack"`) and `one_word` is just `"<sub>"` (e.g. `"town"`). When
+    /// there is no following word, `two_word` is empty.
+    ///
+    /// This enables matching multi-word plugin subcommands like `git town hack`
+    /// against config entries like `"town hack"`, using the same two-word probe
+    /// pattern as the gh evaluator.
+    ///
     /// Skips global flags like `-C <path>` that appear before the subcommand.
-    fn subcommand(ctx: &CommandContext) -> Option<String> {
+    fn subcommands(ctx: &CommandContext) -> (String, String) {
         let mut iter = ctx.words.iter();
         // Advance past env vars to find "git"
         for word in iter.by_ref() {
@@ -66,36 +82,35 @@ impl GitSpec {
             }
         }
         // Skip global flags to find the subcommand
-        loop {
-            let word = iter.next()?;
+        let sub_one = loop {
+            let word = match iter.next() {
+                Some(w) => w,
+                None => return (String::new(), "?".into()),
+            };
             if Self::GLOBAL_ARG_FLAGS.contains(&word.as_str()) {
-                // Consume the flag's argument
-                iter.next();
+                iter.next(); // consume flag argument
                 continue;
             }
             if Self::GLOBAL_SOLO_FLAGS.contains(&word.as_str()) {
                 continue;
             }
-            // Not a global flag — this is the subcommand
-            return Some(word.clone());
-        }
-    }
-
-    /// Format config_env keys for reason strings (e.g. "GIT_CONFIG_GLOBAL").
-    fn env_keys_display(&self) -> String {
-        let mut keys: Vec<&str> = self.config_env.keys().map(|k| k.as_str()).collect();
-        keys.sort();
-        keys.join(", ")
+            break word.clone();
+        };
+        // Build two-word form if a next word exists (and it's not a flag)
+        let sub_two = iter
+            .find(|w| !w.starts_with('-'))
+            .map(|w| format!("{sub_one} {w}"))
+            .unwrap_or_default();
+        (sub_two, sub_one)
     }
 }
 
 impl CommandSpec for GitSpec {
     fn evaluate(&self, ctx: &CommandContext) -> RuleMatch {
-        let sub = Self::subcommand(ctx);
-        let sub_str = sub.as_deref().unwrap_or("?");
+        let (sub_two, sub_one) = Self::subcommands(ctx);
 
-        // Force-push → ask regardless of config
-        if sub_str == "push" {
+        // Force-push flags on `push` → ask regardless of config.
+        if sub_one == "push" {
             let flag_strs: Vec<&str> = self.force_push_flags.iter().map(|s| s.as_str()).collect();
             if ctx.has_any_flag(&flag_strs) {
                 return RuleMatch {
@@ -105,52 +120,22 @@ impl CommandSpec for GitSpec {
             }
         }
 
-        // Read-only git subcommands — always allowed
-        if self.read_only.iter().any(|s| s == sub_str) {
-            if let Some(ref r) = ctx.redirection {
-                return RuleMatch {
-                    decision: Decision::Ask,
-                    reason: format!("git {sub_str} with {}", r.description),
-                };
+        // Try two-word subcommand first (e.g. "town hack"), fall back to one-word
+        // (e.g. "town") if the two-word form isn't recognized. Same probe pattern
+        // as the gh evaluator — see that module for the rationale.
+        if !sub_two.is_empty() {
+            let two_result = self.matcher.evaluate(ctx, "git", &sub_two);
+            if two_result.decision == Decision::Allow {
+                return two_result;
             }
-            return RuleMatch {
-                decision: Decision::Allow,
-                reason: format!("read-only git {sub_str}"),
-            };
-        }
-
-        // Env-gated subcommands: allowed only when all config_env entries match
-        if self.allowed_with_config.iter().any(|s| s == sub_str) {
-            if !self.config_env.is_empty() && ctx.env_satisfies(&self.config_env) {
-                if let Some(ref r) = ctx.redirection {
-                    return RuleMatch {
-                        decision: Decision::Ask,
-                        reason: format!("git {sub_str} with {}", r.description),
-                    };
-                }
-                return RuleMatch {
-                    decision: Decision::Allow,
-                    reason: format!("git {sub_str} with {}", self.env_keys_display()),
-                };
+            let one_result = self.matcher.evaluate(ctx, "git", &sub_one);
+            if one_result.decision == Decision::Allow {
+                return one_result;
             }
-            return RuleMatch {
-                decision: Decision::Ask,
-                reason: format!("git {sub_str} requires confirmation"),
-            };
+            return two_result;
         }
 
-        // --version check
-        if ctx.has_flag("--version") && ctx.words.len() <= 3 {
-            return RuleMatch {
-                decision: Decision::Allow,
-                reason: "git --version".into(),
-            };
-        }
-
-        RuleMatch {
-            decision: Decision::Ask,
-            reason: format!("git {sub_str} requires confirmation"),
-        }
+        self.matcher.evaluate(ctx, "git", &sub_one)
     }
 }
 
@@ -158,6 +143,8 @@ impl CommandSpec for GitSpec {
 mod tests {
     use super::*;
     use crate::config::{Config, GitConfig};
+    use crate::eval::CommandContext;
+    use std::collections::HashMap;
 
     /// Clear `GIT_CONFIG_GLOBAL` from the process environment so the
     /// env-gate fallback in `env_satisfies` doesn't interfere with tests
@@ -189,6 +176,8 @@ mod tests {
                 "diff".into(),
                 "branch".into(),
             ],
+            allow: vec![],
+            mutating: vec![],
             allowed_with_config: vec!["push".into(), "pull".into(), "add".into()],
             config_env: HashMap::from([("GIT_CONFIG_GLOBAL".into(), "~/.gitconfig.ai".into())]),
             force_push_flags: vec!["--force".into(), "-f".into(), "--force-with-lease".into()],
@@ -235,6 +224,11 @@ mod tests {
     #[test]
     fn allow_status() {
         assert_eq!(eval("git status"), Decision::Allow);
+    }
+
+    #[test]
+    fn allow_version() {
+        assert_eq!(eval("git --version"), Decision::Allow);
     }
 
     #[test]
@@ -314,5 +308,37 @@ mod tests {
     fn allow_git_c_config_status() {
         // -c key=value is also a global flag
         assert_eq!(eval("git -c core.pager=cat status"), Decision::Allow);
+    }
+
+    // ── allow list (git-town local commands) ──
+
+    #[test]
+    fn allow_list_allows_town_hack() {
+        let spec = GitSpec::from_config(&GitConfig {
+            read_only: vec![],
+            allow: vec!["town hack".into()],
+            mutating: vec![],
+            allowed_with_config: vec![],
+            config_env: HashMap::new(),
+            force_push_flags: vec![],
+        });
+        let ctx = CommandContext::from_command("git town hack feature-branch");
+        assert_eq!(spec.evaluate(&ctx).decision, Decision::Allow);
+    }
+
+    // ── mutating list ──
+
+    #[test]
+    fn mutating_list_asks_town_sync() {
+        let spec = GitSpec::from_config(&GitConfig {
+            read_only: vec![],
+            allow: vec![],
+            mutating: vec!["town sync".into()],
+            allowed_with_config: vec![],
+            config_env: HashMap::new(),
+            force_push_flags: vec![],
+        });
+        let ctx = CommandContext::from_command("git town sync");
+        assert_eq!(spec.evaluate(&ctx).decision, Decision::Ask);
     }
 }
