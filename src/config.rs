@@ -9,9 +9,11 @@
 //!    inside a git repo). Lets a project permit extra commands without
 //!    loosening user-global rules.
 //!
-//! All overlays use the same semantics: lists extend (deduplicated),
+//! User overlays use full merge semantics: lists extend (deduplicated),
 //! scalars override, `remove_<field>` subtracts, and `replace = true`
-//! replaces entirely.
+//! replaces entirely. Project overlays are restricted to additive
+//! operations only — `replace` and `remove_*` fields are stripped for
+//! security (a repo should not be able to weaken user-global rules).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
