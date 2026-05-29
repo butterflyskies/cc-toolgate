@@ -359,11 +359,16 @@ impl Config {
 
     /// Try to load project overlay from <git-root>/.claude/cc-toolgate.toml.
     /// Returns both the parsed overlay and the path it was loaded from.
+    ///
+    /// Project overlays may only ADD to allow/ask/deny lists. Any `replace` flags
+    /// or `remove_*` lists are stripped and a warning is emitted. This prevents a
+    /// malicious project config from removing safety rules set at the user level.
     fn load_project_overlay() -> Option<(ConfigOverlay, std::path::PathBuf)> {
         let cwd = std::env::current_dir().ok()?;
         let git_root = find_git_root(&cwd)?;
         let path = git_root.join(".claude/cc-toolgate.toml");
-        let overlay = load_overlay_from_path(&path, "project config parse error")?;
+        let mut overlay = load_overlay_from_path(&path, "project config parse error")?;
+        strip_project_overlay_dangerous_fields(&mut overlay, &path);
         Some((overlay, path))
     }
 
@@ -496,6 +501,98 @@ impl Config {
     fn apply_overlay_str(&mut self, toml_str: &str) {
         let overlay: ConfigOverlay = toml::from_str(toml_str).unwrap();
         self.apply_overlay(overlay);
+    }
+}
+
+/// Strip `replace` flags and `remove_*` lists from a project overlay.
+///
+/// Project overlays are untrusted: they live in the repo and could be crafted
+/// by a malicious project to remove safety rules the user relies on. This
+/// function enforces the invariant that project overlays can only ADD entries,
+/// never remove or replace them. If any dangerous field was non-empty/true, a
+/// warning is printed to stderr.
+fn strip_project_overlay_dangerous_fields(overlay: &mut ConfigOverlay, path: &std::path::Path) {
+    let mut stripped = false;
+
+    // commands
+    if overlay.commands.replace
+        || !overlay.commands.remove_allow.is_empty()
+        || !overlay.commands.remove_ask.is_empty()
+        || !overlay.commands.remove_deny.is_empty()
+    {
+        stripped = true;
+    }
+    overlay.commands.replace = false;
+    overlay.commands.remove_allow.clear();
+    overlay.commands.remove_ask.clear();
+    overlay.commands.remove_deny.clear();
+
+    // wrappers
+    if overlay.wrappers.replace
+        || !overlay.wrappers.remove_allow_floor.is_empty()
+        || !overlay.wrappers.remove_ask_floor.is_empty()
+    {
+        stripped = true;
+    }
+    overlay.wrappers.replace = false;
+    overlay.wrappers.remove_allow_floor.clear();
+    overlay.wrappers.remove_ask_floor.clear();
+
+    // git
+    if overlay.git.replace
+        || !overlay.git.remove_read_only.is_empty()
+        || !overlay.git.remove_allowed_with_config.is_empty()
+        || !overlay.git.remove_force_push_flags.is_empty()
+    {
+        stripped = true;
+    }
+    overlay.git.replace = false;
+    overlay.git.remove_read_only.clear();
+    overlay.git.remove_allowed_with_config.clear();
+    overlay.git.remove_force_push_flags.clear();
+
+    // cargo
+    if overlay.cargo.replace
+        || !overlay.cargo.remove_safe_subcommands.is_empty()
+        || !overlay.cargo.remove_allowed_with_config.is_empty()
+    {
+        stripped = true;
+    }
+    overlay.cargo.replace = false;
+    overlay.cargo.remove_safe_subcommands.clear();
+    overlay.cargo.remove_allowed_with_config.clear();
+
+    // kubectl
+    if overlay.kubectl.replace
+        || !overlay.kubectl.remove_read_only.is_empty()
+        || !overlay.kubectl.remove_mutating.is_empty()
+        || !overlay.kubectl.remove_allowed_with_config.is_empty()
+    {
+        stripped = true;
+    }
+    overlay.kubectl.replace = false;
+    overlay.kubectl.remove_read_only.clear();
+    overlay.kubectl.remove_mutating.clear();
+    overlay.kubectl.remove_allowed_with_config.clear();
+
+    // gh
+    if overlay.gh.replace
+        || !overlay.gh.remove_read_only.is_empty()
+        || !overlay.gh.remove_mutating.is_empty()
+        || !overlay.gh.remove_allowed_with_config.is_empty()
+    {
+        stripped = true;
+    }
+    overlay.gh.replace = false;
+    overlay.gh.remove_read_only.clear();
+    overlay.gh.remove_mutating.clear();
+    overlay.gh.remove_allowed_with_config.clear();
+
+    if stripped {
+        eprintln!(
+            "cc-toolgate: project overlay at {} attempted to use replace/remove — stripped for security",
+            path.display()
+        );
     }
 }
 
@@ -897,14 +994,15 @@ mod tests {
     }
 
     #[test]
-    fn config_load_project_overlay_replace_replaces_section() {
+    fn config_load_project_overlay_replace_is_stripped() {
         require_nextest();
 
-        let root = scratch_dir("load-replace");
+        let root = scratch_dir("load-replace-stripped");
         std::fs::create_dir(root.join(".git")).unwrap();
         std::fs::create_dir(root.join(".claude")).unwrap();
-        // A project overlay with replace = true replaces the entire commands
-        // section — only the items in the overlay survive.
+        // A project overlay with replace = true — the replace flag must be
+        // stripped for security. The additive items in the overlay are still
+        // applied, but the default allow list is NOT discarded.
         std::fs::write(
             root.join(".claude/cc-toolgate.toml"),
             r#"
@@ -928,23 +1026,171 @@ mod tests {
 
         std::env::set_current_dir(&original_dir).unwrap();
 
-        // replace = true means the default allow list is gone — only the
-        // overlay's items remain.
-        assert_eq!(
-            config.commands.allow,
-            vec!["only-this"],
-            "replace = true should discard all defaults; only overlay items survive"
+        // replace = true is stripped: the default allow list is preserved.
+        assert!(
+            config.commands.allow.contains(&"ls".to_string()),
+            "replace should be stripped; default 'ls' must still be in allow list"
         );
-        assert_eq!(config.commands.ask, vec!["only-ask"]);
-        assert_eq!(config.commands.deny, vec!["only-deny"]);
+        // The additive items from the overlay are still applied.
+        assert!(
+            config.commands.allow.contains(&"only-this".to_string()),
+            "additive allow items from project overlay should still be applied"
+        );
+        assert!(
+            config.commands.ask.contains(&"only-ask".to_string()),
+            "additive ask items from project overlay should still be applied"
+        );
+        assert!(
+            config.commands.deny.contains(&"only-deny".to_string()),
+            "additive deny items from project overlay should still be applied"
+        );
 
         // Sections NOT mentioned in the overlay are untouched.
         assert!(
             !config.git.read_only.is_empty(),
-            "git read_only should be unaffected by a commands-only replace"
+            "git read_only should be unaffected by a commands-only overlay"
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn config_load_project_overlay_remove_deny_is_stripped() {
+        require_nextest();
+
+        let root = scratch_dir("load-remove-deny-stripped");
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir(root.join(".claude")).unwrap();
+        // A project overlay that tries to remove items from deny — must be stripped.
+        std::fs::write(
+            root.join(".claude/cc-toolgate.toml"),
+            r#"
+            [commands]
+            remove_deny = ["shred"]
+            "#,
+        )
+        .unwrap();
+
+        let fake_home = root.join("fakehome");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        unsafe { std::env::set_var("HOME", &fake_home) };
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+
+        let config = Config::load();
+
+        std::env::set_current_dir(&original_dir).unwrap();
+
+        // remove_deny is stripped: "shred" must still be in deny list.
+        assert!(
+            config.commands.deny.contains(&"shred".to_string()),
+            "remove_deny must be stripped; 'shred' should remain in deny list"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn strip_project_overlay_dangerous_fields_clears_all_sections() {
+        let path = std::path::PathBuf::from("/fake/path/.claude/cc-toolgate.toml");
+        let mut overlay = ConfigOverlay {
+            commands: CommandsOverlay {
+                replace: true,
+                remove_allow: vec!["cat".into()],
+                remove_ask: vec!["rm".into()],
+                remove_deny: vec!["shred".into()],
+                allow: vec!["my-tool".into()],
+                ..Default::default()
+            },
+            wrappers: WrappersOverlay {
+                replace: true,
+                remove_allow_floor: vec!["xargs".into()],
+                remove_ask_floor: vec!["sudo".into()],
+                ..Default::default()
+            },
+            git: GitOverlay {
+                replace: true,
+                remove_read_only: vec!["status".into()],
+                remove_allowed_with_config: vec!["push".into()],
+                remove_force_push_flags: vec!["--force".into()],
+                read_only: vec!["log".into()],
+                ..Default::default()
+            },
+            cargo: CargoOverlay {
+                replace: true,
+                remove_safe_subcommands: vec!["build".into()],
+                remove_allowed_with_config: vec!["publish".into()],
+                ..Default::default()
+            },
+            kubectl: KubectlOverlay {
+                replace: true,
+                remove_read_only: vec!["get".into()],
+                remove_mutating: vec!["apply".into()],
+                remove_allowed_with_config: vec!["exec".into()],
+                ..Default::default()
+            },
+            gh: GhOverlay {
+                replace: true,
+                remove_read_only: vec!["pr list".into()],
+                remove_mutating: vec!["pr merge".into()],
+                remove_allowed_with_config: vec!["pr create".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        strip_project_overlay_dangerous_fields(&mut overlay, &path);
+
+        // All dangerous fields cleared.
+        assert!(!overlay.commands.replace);
+        assert!(overlay.commands.remove_allow.is_empty());
+        assert!(overlay.commands.remove_ask.is_empty());
+        assert!(overlay.commands.remove_deny.is_empty());
+
+        assert!(!overlay.wrappers.replace);
+        assert!(overlay.wrappers.remove_allow_floor.is_empty());
+        assert!(overlay.wrappers.remove_ask_floor.is_empty());
+
+        assert!(!overlay.git.replace);
+        assert!(overlay.git.remove_read_only.is_empty());
+        assert!(overlay.git.remove_allowed_with_config.is_empty());
+        assert!(overlay.git.remove_force_push_flags.is_empty());
+
+        assert!(!overlay.cargo.replace);
+        assert!(overlay.cargo.remove_safe_subcommands.is_empty());
+        assert!(overlay.cargo.remove_allowed_with_config.is_empty());
+
+        assert!(!overlay.kubectl.replace);
+        assert!(overlay.kubectl.remove_read_only.is_empty());
+        assert!(overlay.kubectl.remove_mutating.is_empty());
+        assert!(overlay.kubectl.remove_allowed_with_config.is_empty());
+
+        assert!(!overlay.gh.replace);
+        assert!(overlay.gh.remove_read_only.is_empty());
+        assert!(overlay.gh.remove_mutating.is_empty());
+        assert!(overlay.gh.remove_allowed_with_config.is_empty());
+
+        // Additive fields are preserved.
+        assert_eq!(overlay.commands.allow, vec!["my-tool"]);
+        assert_eq!(overlay.git.read_only, vec!["log"]);
+    }
+
+    #[test]
+    fn strip_project_overlay_no_op_when_safe() {
+        let path = std::path::PathBuf::from("/fake/path/.claude/cc-toolgate.toml");
+        let mut overlay = ConfigOverlay {
+            commands: CommandsOverlay {
+                allow: vec!["my-tool".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Should not panic, and should leave additive fields intact.
+        strip_project_overlay_dangerous_fields(&mut overlay, &path);
+        assert_eq!(overlay.commands.allow, vec!["my-tool"]);
+        assert!(!overlay.commands.replace);
     }
 
     #[test]
