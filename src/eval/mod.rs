@@ -147,6 +147,9 @@ pub struct CommandRegistry {
     wrappers: HashMap<String, Decision>,
     /// When true, DENY decisions are escalated to ASK.
     escalate_deny: bool,
+    /// Path to the project overlay file that contributed to this config,
+    /// if one was loaded. Used to annotate ASK decisions with provenance.
+    project_overlay_path: Option<std::path::PathBuf>,
 }
 
 impl CommandRegistry {
@@ -211,6 +214,7 @@ impl CommandRegistry {
             specs,
             wrappers,
             escalate_deny: config.settings.escalate_deny,
+            project_overlay_path: config.project_overlay_path.clone(),
         }
     }
 
@@ -282,9 +286,24 @@ impl CommandRegistry {
         result
     }
 
+    /// Annotate an ASK decision with project overlay provenance, if applicable.
+    fn maybe_annotate_project_overlay(&self, mut result: RuleMatch) -> RuleMatch {
+        if result.decision == Decision::Ask
+            && let Some(ref path) = self.project_overlay_path
+        {
+            result.reason = format!(
+                "{} (project config at {} contributed to this decision)",
+                result.reason,
+                path.display()
+            );
+        }
+        result
+    }
+
     /// Evaluate a single (non-compound) command against the registry.
     pub fn evaluate_single(&self, command: &str) -> RuleMatch {
-        self.evaluate_single_with_env(command, &HashMap::new())
+        let result = self.evaluate_single_with_env(command, &HashMap::new());
+        self.maybe_annotate_project_overlay(result)
     }
 
     /// Evaluate a single command with accumulated environment from prior segments.
@@ -482,10 +501,10 @@ impl CommandRegistry {
             format!("compound command ({})", desc.join("; "))
         };
 
-        RuleMatch {
+        self.maybe_annotate_project_overlay(RuleMatch {
             decision: strictest,
             reason: format!("{}:\n{}", header, reasons.join("\n")),
-        }
+        })
     }
 }
 
@@ -955,6 +974,90 @@ mod tests {
             result.decision,
             Decision::Allow,
             "reason: {}",
+            result.reason
+        );
+    }
+
+    // ── Project overlay consent annotation ──
+
+    /// Build a registry with a project overlay path set.
+    fn registry_with_project_overlay() -> CommandRegistry {
+        let mut config = crate::config::Config::default_config();
+        config.project_overlay_path = Some(std::path::PathBuf::from(
+            "/fake/repo/.claude/cc-toolgate.toml",
+        ));
+        CommandRegistry::from_config(&config)
+    }
+
+    #[test]
+    fn ask_decision_annotated_with_project_overlay_path() {
+        let reg = registry_with_project_overlay();
+        // "curl" is in the default ask list — should produce ASK with annotation
+        let result = reg.evaluate_single("curl https://example.com");
+        assert_eq!(result.decision, Decision::Ask);
+        assert!(
+            result.reason.contains("project config at"),
+            "ASK reason should mention project config; got: {}",
+            result.reason
+        );
+        assert!(
+            result
+                .reason
+                .contains("/fake/repo/.claude/cc-toolgate.toml"),
+            "ASK reason should include overlay path; got: {}",
+            result.reason
+        );
+    }
+
+    #[test]
+    fn allow_decision_not_annotated_with_project_overlay_path() {
+        let reg = registry_with_project_overlay();
+        // "ls" is in the default allow list — should NOT have annotation
+        let result = reg.evaluate_single("ls -la");
+        assert_eq!(result.decision, Decision::Allow);
+        assert!(
+            !result.reason.contains("project config at"),
+            "ALLOW reason should not mention project config; got: {}",
+            result.reason
+        );
+    }
+
+    #[test]
+    fn deny_decision_not_annotated_with_project_overlay_path() {
+        let reg = registry_with_project_overlay();
+        // "shred" is in the default deny list — DENY should NOT have annotation
+        let result = reg.evaluate_single("shred /etc/passwd");
+        assert_eq!(result.decision, Decision::Deny);
+        assert!(
+            !result.reason.contains("project config at"),
+            "DENY reason should not mention project config; got: {}",
+            result.reason
+        );
+    }
+
+    #[test]
+    fn no_annotation_without_project_overlay() {
+        // Registry without project overlay — no annotation on ASK
+        let config = crate::config::Config::default_config();
+        let reg = CommandRegistry::from_config(&config);
+        let result = reg.evaluate_single("curl https://example.com");
+        assert_eq!(result.decision, Decision::Ask);
+        assert!(
+            !result.reason.contains("project config at"),
+            "without project overlay, reason should not mention project config; got: {}",
+            result.reason
+        );
+    }
+
+    #[test]
+    fn compound_ask_decision_annotated_with_project_overlay() {
+        let reg = registry_with_project_overlay();
+        // Compound command where one segment is ASK
+        let result = reg.evaluate("ls -la ; curl https://example.com");
+        assert_eq!(result.decision, Decision::Ask);
+        assert!(
+            result.reason.contains("project config at"),
+            "compound ASK reason should mention project config; got: {}",
             result.reason
         );
     }
