@@ -126,7 +126,7 @@ fn text_replacing_substitutions(
     if relevant.is_empty() {
         return source[start..end].to_string();
     }
-    relevant.sort_by(|a, b| b.start.cmp(&a.start));
+    relevant.sort_by_key(|s| std::cmp::Reverse(s.start));
     let mut text = source[start..end].to_string();
     for sub in relevant {
         text.replace_range((sub.start - start)..(sub.end - start), "__SUBST__");
