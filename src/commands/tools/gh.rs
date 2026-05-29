@@ -1,132 +1,119 @@
 //! Subcommand-aware GitHub CLI (gh) evaluation.
 //!
-//! gh uses two-word subcommands (`pr list`, `issue create`), so both the
-//! two-word form and one-word fallback are checked against the config lists.
-//! Supports env-gated auto-allow and redirection escalation.
+//! gh uses two-word subcommands (`pr list`, `issue create`), so the spec
+//! extracts both the two-word form and the one-word fallback, then tries
+//! them in order against the matcher. The `allow` field supports future
+//! gh subcommands that are safe but neither read-only nor env-gated.
 
 use super::super::CommandSpec;
 use crate::config::GhConfig;
+use crate::eval::matcher::SubcommandMatcher;
 use crate::eval::{CommandContext, Decision, RuleMatch};
-use std::collections::HashMap;
 
 /// Subcommand-aware gh CLI evaluator.
 ///
 /// Evaluation order:
-/// 1. Read-only subcommands → ALLOW (with redirection escalation)
-/// 2. Env-gated subcommands → ALLOW if all `config_env` entries match, else ASK
-/// 3. Known mutating subcommands → ASK
-/// 4. Everything else → ASK
+/// 1. Try two-word subcommand (`pr list`) through the matcher pipeline
+/// 2. If matcher returns ASK on the two-word form, try one-word fallback (`pr`)
+///    — only upgrades to ALLOW; ASK/Deny stays at two-word result
+/// 3. Pipeline: read_only → allow → allowed_with_config → mutating → fallthrough
+///
+/// Note: the two-word-then-one-word probe order ensures that `pr list` in
+/// `read_only` matches before `pr` alone could hit `mutating`. The one-word
+/// fallback only fires when the two-word form isn't recognized, so it can
+/// never override an explicit two-word classification.
 pub struct GhSpec {
-    /// Read-only subcommands (e.g. `pr list`, `pr view`, `status`).
-    read_only: Vec<String>,
-    /// Known mutating subcommands (e.g. `pr create`, `repo delete`).
-    mutating: Vec<String>,
-    /// Subcommands allowed only when all `config_env` entries match.
-    allowed_with_config: Vec<String>,
-    /// Required env var name→value pairs that gate `allowed_with_config` subcommands.
-    config_env: HashMap<String, String>,
+    matcher: SubcommandMatcher,
 }
 
 impl GhSpec {
     /// Build a gh spec from configuration.
     pub fn from_config(config: &GhConfig) -> Self {
         Self {
-            read_only: config.read_only.clone(),
-            mutating: config.mutating.clone(),
-            allowed_with_config: config.allowed_with_config.clone(),
-            config_env: config.config_env.clone(),
+            matcher: SubcommandMatcher::new(
+                config.read_only.clone(),
+                config.allow.clone(),
+                config.mutating.clone(),
+                config.allowed_with_config.clone(),
+                config.config_env.clone(),
+            ),
         }
     }
 
-    /// Get the two-word subcommand (e.g. "pr list") and one-word fallback.
-    /// Handles env var prefixes like `GH_TOKEN=abc gh pr create`.
+    /// Global gh flags that consume the next word as their argument.
+    const GLOBAL_ARG_FLAGS: &[&str] = &["--hostname", "-R", "--repo"];
+
+    /// Extract subcommands, skipping global flags.
+    /// Returns `(two_word, one_word)` like `("pr list", "pr")`.
     fn subcommands(ctx: &CommandContext) -> (String, String) {
-        // Find position of "gh" in the word list (may be preceded by env vars)
-        let gh_pos = ctx.words.iter().position(|w| w == "gh");
-        let after_gh = gh_pos.map(|p| p + 1).unwrap_or(1);
-
-        let sub_two = if ctx.words.len() > after_gh + 1 {
-            format!("{} {}", ctx.words[after_gh], ctx.words[after_gh + 1])
-        } else {
-            String::new()
+        let mut iter = ctx.words.iter();
+        for word in iter.by_ref() {
+            if word == "gh" {
+                break;
+            }
+        }
+        let sub_one = loop {
+            let word = match iter.next() {
+                Some(w) => w,
+                None => return (String::new(), "?".into()),
+            };
+            if Self::GLOBAL_ARG_FLAGS.contains(&word.as_str()) {
+                iter.next();
+                continue;
+            }
+            if word.starts_with('-') {
+                continue;
+            }
+            break word.clone();
         };
-        let sub_one = ctx
-            .words
-            .get(after_gh)
-            .cloned()
-            .unwrap_or_else(|| "?".to_string());
+        let sub_two = iter
+            .find(|w| !w.starts_with('-'))
+            .map(|w| format!("{sub_one} {w}"))
+            .unwrap_or_default();
         (sub_two, sub_one)
-    }
-
-    /// Format config_env keys for reason strings.
-    fn env_keys_display(&self) -> String {
-        let mut keys: Vec<&str> = self.config_env.keys().map(|k| k.as_str()).collect();
-        keys.sort();
-        keys.join(", ")
     }
 }
 
 impl CommandSpec for GhSpec {
     fn evaluate(&self, ctx: &CommandContext) -> RuleMatch {
-        let (sub_two, sub_one) = Self::subcommands(ctx);
-
-        let in_read_only = self.read_only.iter().any(|s| s == &sub_two)
-            || self.read_only.iter().any(|s| s == &sub_one);
-        if in_read_only {
-            if let Some(ref r) = ctx.redirection {
-                return RuleMatch {
-                    decision: Decision::Ask,
-                    reason: format!("gh {sub_one} with {}", r.description),
-                };
-            }
+        // `gh --version` has no subcommand word; the extractor returns "--version"
+        // as sub_one, which never matches any config list. Handle it here — same
+        // pattern as cargo's --version/-V pre-check.
+        if ctx.has_flag("--version") {
             return RuleMatch {
                 decision: Decision::Allow,
-                reason: format!("read-only gh {sub_two}"),
+                reason: "gh --version".into(),
+                matched: true,
             };
         }
 
-        // Env-gated subcommands: allowed only when all config_env entries match
-        let in_env_gated = self.allowed_with_config.iter().any(|s| s == &sub_two)
-            || self.allowed_with_config.iter().any(|s| s == &sub_one);
-        if in_env_gated {
-            if !self.config_env.is_empty() && ctx.env_satisfies(&self.config_env) {
-                if let Some(ref r) = ctx.redirection {
-                    return RuleMatch {
-                        decision: Decision::Ask,
-                        reason: format!("gh {sub_one} with {}", r.description),
-                    };
-                }
-                return RuleMatch {
-                    decision: Decision::Allow,
-                    reason: format!("gh {sub_two} with {}", self.env_keys_display()),
-                };
+        let (sub_two, sub_one) = Self::subcommands(ctx);
+
+        // Try two-word first, fall back to one-word only if unrecognized.
+        if !sub_two.is_empty() {
+            let two_result = self.matcher.evaluate(ctx, "gh", &sub_two);
+            if two_result.decision == Decision::Allow {
+                return two_result;
             }
-            return RuleMatch {
-                decision: Decision::Ask,
-                reason: format!("gh {sub_two} requires confirmation"),
-            };
+            if !two_result.matched {
+                let one_result = self.matcher.evaluate(ctx, "gh", &sub_one);
+                if one_result.decision == Decision::Allow {
+                    return one_result;
+                }
+            }
+            return two_result;
         }
 
-        let in_mutating = self.mutating.iter().any(|s| s == &sub_two)
-            || self.mutating.iter().any(|s| s == &sub_one);
-        if in_mutating {
-            return RuleMatch {
-                decision: Decision::Ask,
-                reason: format!("gh {sub_two} requires confirmation"),
-            };
-        }
-
-        RuleMatch {
-            decision: Decision::Ask,
-            reason: format!("gh {sub_one} requires confirmation"),
-        }
+        self.matcher.evaluate(ctx, "gh", &sub_one)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, GhConfig};
+    use crate::eval::CommandContext;
+    use std::collections::HashMap;
 
     fn spec() -> GhSpec {
         GhSpec::from_config(&Config::default_config().gh)
@@ -174,6 +161,11 @@ mod tests {
     }
 
     #[test]
+    fn allow_version() {
+        assert_eq!(eval("gh --version"), Decision::Allow);
+    }
+
+    #[test]
     fn redir_pr_list() {
         assert_eq!(eval("gh pr list > /tmp/prs.txt"), Decision::Ask);
     }
@@ -183,6 +175,7 @@ mod tests {
     fn spec_with_env_gate() -> GhSpec {
         GhSpec::from_config(&GhConfig {
             read_only: vec!["pr list".into(), "pr view".into(), "status".into()],
+            allow: vec![],
             mutating: vec!["repo delete".into()],
             allowed_with_config: vec!["pr create".into(), "pr merge".into()],
             config_env: HashMap::from([("GH_CONFIG_DIR".into(), "~/.config/gh-ai".into())]),

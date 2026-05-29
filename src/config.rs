@@ -103,6 +103,13 @@ pub struct GitConfig {
     /// Subcommands that are always allowed (e.g. `status`, `log`, `diff`, `branch`).
     #[serde(default)]
     pub read_only: Vec<String>,
+    /// Safe local operations that are always allowed (e.g. git-town local branch management).
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Mutating operations that always require confirmation (e.g. remote-affecting or
+    /// filesystem-modifying subcommands that warrant user review).
+    #[serde(default)]
+    pub mutating: Vec<String>,
     /// Subcommands that are allowed only when all `config_env` entries match
     /// (e.g. `push`, `pull` when `GIT_CONFIG_GLOBAL=~/.gitconfig.ai`).
     #[serde(default)]
@@ -125,21 +132,10 @@ pub struct CargoConfig {
     /// Subcommands that are always allowed (e.g. `build`, `test`, `check`, `clippy`).
     #[serde(default)]
     pub safe_subcommands: Vec<String>,
-    /// Subcommands allowed only when all `config_env` entries match.
-    #[serde(default)]
-    pub allowed_with_config: Vec<String>,
-    /// Environment variable requirements for `allowed_with_config` subcommands.
-    #[serde(default)]
-    pub config_env: HashMap<String, String>,
-}
-
-/// kubectl subcommand evaluation rules.
-#[derive(Debug, Deserialize, Serialize, Default)]
-pub struct KubectlConfig {
-    /// Read-only subcommands that are always allowed (e.g. `get`, `describe`, `logs`).
+    /// Additional read-only subcommands (informational, no side effects).
     #[serde(default)]
     pub read_only: Vec<String>,
-    /// Known mutating subcommands that always require confirmation (e.g. `apply`, `delete`).
+    /// Mutating subcommands that always require confirmation.
     #[serde(default)]
     pub mutating: Vec<String>,
     /// Subcommands allowed only when all `config_env` entries match.
@@ -159,7 +155,30 @@ pub struct GhConfig {
     /// Read-only subcommands (e.g. `pr list`, `pr view`, `status`, `api`).
     #[serde(default)]
     pub read_only: Vec<String>,
+    /// Safe subcommands that are always allowed (between read-only and mutating).
+    #[serde(default)]
+    pub allow: Vec<String>,
     /// Known mutating subcommands (e.g. `pr create`, `pr merge`, `repo delete`).
+    #[serde(default)]
+    pub mutating: Vec<String>,
+    /// Subcommands allowed only when all `config_env` entries match.
+    #[serde(default)]
+    pub allowed_with_config: Vec<String>,
+    /// Environment variable requirements for `allowed_with_config` subcommands.
+    #[serde(default)]
+    pub config_env: HashMap<String, String>,
+}
+
+/// kubectl subcommand evaluation rules.
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct KubectlConfig {
+    /// Read-only subcommands that are always allowed (e.g. `get`, `describe`, `logs`).
+    #[serde(default)]
+    pub read_only: Vec<String>,
+    /// Safe subcommands that are always allowed (between read-only and mutating).
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Known mutating subcommands that always require confirmation (e.g. `apply`, `delete`).
     #[serde(default)]
     pub mutating: Vec<String>,
     /// Subcommands allowed only when all `config_env` entries match.
@@ -238,12 +257,22 @@ struct GitOverlay {
     #[serde(default)]
     read_only: Vec<String>,
     #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    mutating: Vec<String>,
+    #[serde(default)]
     allowed_with_config: Vec<String>,
     config_env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    remove_config_env: Vec<String>,
     #[serde(default)]
     force_push_flags: Vec<String>,
     #[serde(default)]
     remove_read_only: Vec<String>,
+    #[serde(default)]
+    remove_allow: Vec<String>,
+    #[serde(default)]
+    remove_mutating: Vec<String>,
     #[serde(default)]
     remove_allowed_with_config: Vec<String>,
     #[serde(default)]
@@ -257,10 +286,20 @@ struct CargoOverlay {
     #[serde(default)]
     safe_subcommands: Vec<String>,
     #[serde(default)]
+    read_only: Vec<String>,
+    #[serde(default)]
+    mutating: Vec<String>,
+    #[serde(default)]
     allowed_with_config: Vec<String>,
     config_env: Option<HashMap<String, String>>,
     #[serde(default)]
+    remove_config_env: Vec<String>,
+    #[serde(default)]
     remove_safe_subcommands: Vec<String>,
+    #[serde(default)]
+    remove_read_only: Vec<String>,
+    #[serde(default)]
+    remove_mutating: Vec<String>,
     #[serde(default)]
     remove_allowed_with_config: Vec<String>,
 }
@@ -272,12 +311,18 @@ struct KubectlOverlay {
     #[serde(default)]
     read_only: Vec<String>,
     #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
     mutating: Vec<String>,
     #[serde(default)]
     allowed_with_config: Vec<String>,
     config_env: Option<HashMap<String, String>>,
     #[serde(default)]
+    remove_config_env: Vec<String>,
+    #[serde(default)]
     remove_read_only: Vec<String>,
+    #[serde(default)]
+    remove_allow: Vec<String>,
     #[serde(default)]
     remove_mutating: Vec<String>,
     #[serde(default)]
@@ -291,12 +336,18 @@ struct GhOverlay {
     #[serde(default)]
     read_only: Vec<String>,
     #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
     mutating: Vec<String>,
     #[serde(default)]
     allowed_with_config: Vec<String>,
     config_env: Option<HashMap<String, String>>,
     #[serde(default)]
+    remove_config_env: Vec<String>,
+    #[serde(default)]
     remove_read_only: Vec<String>,
+    #[serde(default)]
+    remove_allow: Vec<String>,
     #[serde(default)]
     remove_mutating: Vec<String>,
     #[serde(default)]
@@ -415,6 +466,13 @@ impl Config {
             &g.remove_read_only,
             g.replace,
         );
+        merge_list(&mut self.git.allow, g.allow, &g.remove_allow, g.replace);
+        merge_list(
+            &mut self.git.mutating,
+            g.mutating,
+            &g.remove_mutating,
+            g.replace,
+        );
         merge_list(
             &mut self.git.allowed_with_config,
             g.allowed_with_config,
@@ -427,8 +485,16 @@ impl Config {
             &g.remove_force_push_flags,
             g.replace,
         );
+        for key in &g.remove_config_env {
+            self.git.config_env.remove(key);
+        }
         if let Some(v) = g.config_env {
-            self.git.config_env = v;
+            self.git.config_env.extend(v);
+        }
+        if self.git.force_push_flags.is_empty() {
+            eprintln!(
+                "cc-toolgate: warning: git.force_push_flags is empty — force-push detection disabled"
+            );
         }
 
         // Cargo
@@ -440,13 +506,28 @@ impl Config {
             ca.replace,
         );
         merge_list(
+            &mut self.cargo.read_only,
+            ca.read_only,
+            &ca.remove_read_only,
+            ca.replace,
+        );
+        merge_list(
+            &mut self.cargo.mutating,
+            ca.mutating,
+            &ca.remove_mutating,
+            ca.replace,
+        );
+        merge_list(
             &mut self.cargo.allowed_with_config,
             ca.allowed_with_config,
             &ca.remove_allowed_with_config,
             ca.replace,
         );
+        for key in &ca.remove_config_env {
+            self.cargo.config_env.remove(key);
+        }
         if let Some(v) = ca.config_env {
-            self.cargo.config_env = v;
+            self.cargo.config_env.extend(v);
         }
 
         // Kubectl
@@ -457,6 +538,7 @@ impl Config {
             &k.remove_read_only,
             k.replace,
         );
+        merge_list(&mut self.kubectl.allow, k.allow, &k.remove_allow, k.replace);
         merge_list(
             &mut self.kubectl.mutating,
             k.mutating,
@@ -469,8 +551,11 @@ impl Config {
             &k.remove_allowed_with_config,
             k.replace,
         );
+        for key in &k.remove_config_env {
+            self.kubectl.config_env.remove(key);
+        }
         if let Some(v) = k.config_env {
-            self.kubectl.config_env = v;
+            self.kubectl.config_env.extend(v);
         }
 
         // Gh
@@ -481,6 +566,7 @@ impl Config {
             &gh.remove_read_only,
             gh.replace,
         );
+        merge_list(&mut self.gh.allow, gh.allow, &gh.remove_allow, gh.replace);
         merge_list(
             &mut self.gh.mutating,
             gh.mutating,
@@ -493,8 +579,11 @@ impl Config {
             &gh.remove_allowed_with_config,
             gh.replace,
         );
+        for key in &gh.remove_config_env {
+            self.gh.config_env.remove(key);
+        }
         if let Some(v) = gh.config_env {
-            self.gh.config_env = v;
+            self.gh.config_env.extend(v);
         }
     }
 
@@ -858,10 +947,16 @@ mod tests {
             r#"
             [git]
             allowed_with_config = ["push"]
-            config_env_var = "GIT_CONFIG_GLOBAL"
+            [git.config_env]
+            GIT_CONFIG_GLOBAL = "~/.gitconfig.ai"
         "#,
         );
         assert_eq!(config.kubectl.read_only, original_kubectl_read_only);
+        assert_eq!(config.git.allowed_with_config, vec!["push"]);
+        assert_eq!(
+            config.git.config_env.get("GIT_CONFIG_GLOBAL").unwrap(),
+            "~/.gitconfig.ai"
+        );
     }
 
     #[test]

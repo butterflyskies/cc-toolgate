@@ -42,4 +42,11 @@ pub struct RuleMatch {
     pub decision: Decision,
     /// Human-readable explanation of why this decision was reached.
     pub reason: String,
+    /// Whether the subcommand was explicitly matched in a classification list.
+    ///
+    /// `true` for steps 1–4 (read_only, allow, allowed_with_config, mutating).
+    /// `false` for step 5 (fallthrough / unrecognized subcommand).
+    /// Used by multi-word probe logic: only try the one-word fallback when the
+    /// two-word result was unrecognized (i.e. `matched == false`).
+    pub matched: bool,
 }

@@ -5,32 +5,49 @@
 
 use super::super::CommandSpec;
 use crate::config::CargoConfig;
+use crate::eval::matcher::SubcommandMatcher;
 use crate::eval::{CommandContext, Decision, RuleMatch};
-use std::collections::HashMap;
 
 /// Subcommand-aware cargo evaluator.
 ///
 /// Evaluation order:
-/// 1. Safe subcommands → ALLOW (with redirection escalation)
-/// 2. Env-gated subcommands → ALLOW if all `config_env` entries match, else ASK
-/// 3. `--version` / `-V` → ALLOW
-/// 4. Everything else → ASK
+/// 1. `--version` / `-V` at any position → ALLOW
+///    (checked before subcommand extraction: `cargo -V` has no subcommand word)
+/// 2. Safe subcommands (`safe_subcommands`) → ALLOW (redirection escalates to ASK)
+/// 3. Read-only subcommands → ALLOW (redirection escalates to ASK)
+/// 4. Env-gated subcommands → ALLOW if all `config_env` entries match, else ASK
+/// 5. Mutating subcommands → ASK
+/// 6. Everything else → ASK
+///
+/// Note: `--version`/`-V` is checked first because `cargo --version` produces no
+/// subcommand word and would otherwise fall through to "requires confirmation".
+/// The `has_any_flag` check is kept here (not in config) because it's a flag
+/// pattern, not a subcommand, and doesn't fit the SubcommandMatcher model.
 pub struct CargoSpec {
-    /// Subcommands that are always safe (e.g. `build`, `test`, `check`).
-    safe_subcommands: Vec<String>,
-    /// Subcommands allowed only when all `config_env` entries match.
-    allowed_with_config: Vec<String>,
-    /// Required env var name→value pairs that gate `allowed_with_config` subcommands.
-    config_env: HashMap<String, String>,
+    matcher: SubcommandMatcher,
 }
 
 impl CargoSpec {
     /// Build a cargo spec from configuration.
+    ///
+    /// `safe_subcommands` and `read_only` are both unconditionally-allowed lists;
+    /// they are combined into the matcher's `read_only` slot.
     pub fn from_config(config: &CargoConfig) -> Self {
+        // Merge safe_subcommands + read_only into a single read_only list.
+        let mut read_only = config.safe_subcommands.clone();
+        for s in &config.read_only {
+            if !read_only.contains(s) {
+                read_only.push(s.clone());
+            }
+        }
         Self {
-            safe_subcommands: config.safe_subcommands.clone(),
-            allowed_with_config: config.allowed_with_config.clone(),
-            config_env: config.config_env.clone(),
+            matcher: SubcommandMatcher::new(
+                read_only,
+                vec![], // cargo has no unconditional "allow" tier between read_only and gated
+                config.mutating.clone(),
+                config.allowed_with_config.clone(),
+                config.config_env.clone(),
+            ),
         }
     }
 
@@ -45,71 +62,33 @@ impl CargoSpec {
         }
         None
     }
-
-    /// Format config_env keys for reason strings.
-    fn env_keys_display(&self) -> String {
-        let mut keys: Vec<&str> = self.config_env.keys().map(|k| k.as_str()).collect();
-        keys.sort();
-        keys.join(", ")
-    }
 }
 
 impl CommandSpec for CargoSpec {
     fn evaluate(&self, ctx: &CommandContext) -> RuleMatch {
-        let sub_str = Self::subcommand(ctx).unwrap_or("?");
-
-        if self.safe_subcommands.iter().any(|s| s == sub_str) {
-            if let Some(ref r) = ctx.redirection {
-                return RuleMatch {
-                    decision: Decision::Ask,
-                    reason: format!("cargo {sub_str} with {}", r.description),
-                };
-            }
-            return RuleMatch {
-                decision: Decision::Allow,
-                reason: format!("cargo {sub_str}"),
-            };
-        }
-
-        // Env-gated subcommands: allowed only when all config_env entries match
-        if self.allowed_with_config.iter().any(|s| s == sub_str) {
-            if !self.config_env.is_empty() && ctx.env_satisfies(&self.config_env) {
-                if let Some(ref r) = ctx.redirection {
-                    return RuleMatch {
-                        decision: Decision::Ask,
-                        reason: format!("cargo {sub_str} with {}", r.description),
-                    };
-                }
-                return RuleMatch {
-                    decision: Decision::Allow,
-                    reason: format!("cargo {sub_str} with {}", self.env_keys_display()),
-                };
-            }
-            return RuleMatch {
-                decision: Decision::Ask,
-                reason: format!("cargo {sub_str} requires confirmation"),
-            };
-        }
-
-        // --version / -V at any position
+        // Check --version/-V before extracting a subcommand: `cargo --version` and
+        // `cargo -V` have no subcommand word and would otherwise fall through.
+        // TODO(review): consider adding "--version" and "-V" as read_only subcommands
+        // in config instead, but that requires the matcher to understand flag-as-subcommand.
         if ctx.has_any_flag(&["--version", "-V"]) {
             return RuleMatch {
                 decision: Decision::Allow,
                 reason: "cargo --version".into(),
+                matched: true,
             };
         }
 
-        RuleMatch {
-            decision: Decision::Ask,
-            reason: format!("cargo {sub_str} requires confirmation"),
-        }
+        let sub = Self::subcommand(ctx).unwrap_or("?");
+        self.matcher.evaluate(ctx, "cargo", sub)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{CargoConfig, Config};
+    use crate::eval::CommandContext;
+    use std::collections::HashMap;
 
     fn spec() -> CargoSpec {
         CargoSpec::from_config(&Config::default_config().cargo)
@@ -166,6 +145,8 @@ mod tests {
     fn spec_with_env_gate() -> CargoSpec {
         CargoSpec::from_config(&CargoConfig {
             safe_subcommands: vec!["build".into(), "check".into(), "test".into()],
+            read_only: vec![],
+            mutating: vec![],
             allowed_with_config: vec!["install".into(), "publish".into()],
             config_env: HashMap::from([("CARGO_INSTALL_ROOT".into(), "/tmp/bin".into())]),
         })

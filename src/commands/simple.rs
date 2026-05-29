@@ -24,32 +24,35 @@ impl CommandSpec for SimpleCommandSpec {
     fn evaluate(&self, ctx: &CommandContext) -> RuleMatch {
         match self.decision {
             Decision::Allow => {
-                // Check for --version on any allowed command
                 if ctx.words.len() <= 3 && ctx.has_flag("--version") {
                     return RuleMatch {
                         decision: Decision::Allow,
                         reason: format!("{} --version", ctx.base_command),
+                        matched: true,
                     };
                 }
-                // Redirection escalates ALLOW → ASK
                 if let Some(ref r) = ctx.redirection {
                     return RuleMatch {
                         decision: Decision::Ask,
                         reason: format!("{} with {}", ctx.base_command, r.description),
+                        matched: true,
                     };
                 }
                 RuleMatch {
                     decision: Decision::Allow,
                     reason: format!("allowed: {}", ctx.base_command),
+                    matched: true,
                 }
             }
             Decision::Ask => RuleMatch {
                 decision: Decision::Ask,
                 reason: format!("{} requires confirmation", ctx.base_command),
+                matched: true,
             },
             Decision::Deny => RuleMatch {
                 decision: Decision::Deny,
                 reason: format!("blocked command: {}", ctx.base_command),
+                matched: true,
             },
         }
     }

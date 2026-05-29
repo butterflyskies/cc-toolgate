@@ -668,6 +668,67 @@ fn export_and_assign_before_redirect_segments_not_escalated() {
     );
 }
 
+// ── source/. moved to ask (issue #22) ──
+
+decision_test!(ask_source_script, "source ~/.bashrc", Ask);
+decision_test!(ask_dot_script, ". /etc/profile", Ask);
+
+// ── git-town: read-only ──
+
+decision_test!(allow_git_town_branch, "git town branch", Allow);
+decision_test!(allow_git_town_status, "git town status", Allow);
+decision_test!(allow_git_town_config, "git town config", Allow);
+decision_test!(allow_git_town_diff_parent, "git town diff-parent", Allow);
+
+// ── git-town: safe local operations ──
+
+decision_test!(allow_git_town_hack, "git town hack my-branch", Allow);
+decision_test!(allow_git_town_append, "git town append child-branch", Allow);
+decision_test!(allow_git_town_compress, "git town compress", Allow);
+decision_test!(allow_git_town_switch, "git town switch", Allow);
+decision_test!(allow_git_town_undo, "git town undo", Allow);
+decision_test!(allow_git_town_prepend, "git town prepend parent", Allow);
+decision_test!(allow_git_town_set_parent, "git town set-parent", Allow);
+
+// ── git-town: mutating (remote-affecting) ──
+
+decision_test!(ask_git_town_sync, "git town sync", Ask);
+decision_test!(ask_git_town_ship, "git town ship", Ask);
+decision_test!(ask_git_town_propose, "git town propose", Ask);
+decision_test!(ask_git_town_delete, "git town delete", Ask);
+decision_test!(ask_git_town_repo, "git town repo", Ask);
+
+// ── git fetch is read-only ──
+
+decision_test!(allow_git_fetch, "git fetch origin", Allow);
+
+// ── two-word mutating overrides one-word read_only ──
+
+decision_test!(ask_stash_drop, "git stash drop", Ask);
+decision_test!(ask_stash_clear, "git stash clear", Ask);
+decision_test!(allow_stash_bare, "git stash", Allow);
+decision_test!(
+    ask_remote_add,
+    "git remote add upstream https://example.com",
+    Ask
+);
+decision_test!(ask_remote_remove, "git remote remove upstream", Ask);
+decision_test!(allow_remote_bare, "git remote", Allow);
+decision_test!(allow_git_town_bare, "git town", Allow);
+
+// ── gh global flag skipping ──
+
+decision_test!(
+    allow_gh_hostname_pr_list,
+    "gh --hostname github.com pr list",
+    Allow
+);
+decision_test!(
+    allow_gh_repo_flag_pr_view,
+    "gh -R owner/repo pr view 123",
+    Allow
+);
+
 // ── Pipeline redirection propagation (issue #37) ──
 
 decision_test!(

@@ -48,11 +48,9 @@ allow = [
     # Environment
     "printenv", "locale",
     # Shell builtins / control
-    # Note: source/. can execute arbitrary code. They're allowed by default
-    # because Claude Code commonly uses them for env setup. Move to ask list
-    # with remove_allow = ["source", "."] if this concerns you.
+    # source/. execute arbitrary code — kept in ask, not allow
     "test", "[", "true", "false", "type", "command", "hash",
-    "export", "unset", "set", "source", ".",
+    "export", "unset", "set",
     "sleep", "seq", "yes",
     # Process inspection
     "ps", "top", "htop", "pgrep",
@@ -75,6 +73,8 @@ ask = [
     "pip", "pip3", "npm", "npx", "yarn", "pnpm",
     "python", "python3", "node", "ruby", "perl",
     "make", "cmake", "ninja",
+    # source/. execute arbitrary code
+    "source", ".",
 ]
 
 deny = [
@@ -109,6 +109,36 @@ read_only = [
     "status", "log", "diff", "show", "branch", "tag", "remote",
     "rev-parse", "ls-files", "ls-tree", "shortlog",
     "blame", "describe", "stash",
+    # fetch is read-only (downloads objects but does not modify working tree or branches)
+    "fetch",
+    # --version: treated as a subcommand by the extractor (git --version has no subcommand word)
+    "--version",
+    # git-town: bare `git town` shows help
+    "town",
+    # git-town: informational / read-only
+    "town branch", "town config", "town diff-parent", "town help",
+    "town status", "town runlog", "town completions", "town offline",
+]
+
+# Safe local operations — auto-allowed.
+allow = [
+    # git-town: local branch management
+    "town hack", "town append", "town prepend", "town set-parent",
+    "town swap", "town detach", "town down", "town up", "town switch",
+    "town contribute", "town feature", "town observe", "town park",
+    "town prototype", "town init", "town continue", "town skip",
+    "town undo", "town rename", "town compress", "town walk",
+    "town commit", "town merge",
+]
+
+# Mutating operations — always ask.
+mutating = [
+    # git-town: remote-affecting
+    "town sync", "town ship", "town propose", "town delete", "town repo",
+    # destructive stash/remote operations (one-word prefixes are in read_only,
+    # but the two-word match takes precedence when matched)
+    "stash drop", "stash clear",
+    "remote add", "remote remove", "remote rename", "remote set-url",
 ]
 
 # Subcommands auto-allowed only when all config_env entries match.
