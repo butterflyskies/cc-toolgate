@@ -398,7 +398,6 @@ impl CommandRegistry {
                 None => true,
             };
             if is_passthrough {
-                // evaluate_single already applies project overlay annotation
                 return self.evaluate_single(command);
             }
         }
