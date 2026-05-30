@@ -19,7 +19,13 @@ fn main() {
     // --dump-ast <command>: print tree-sitter AST and parsed pipeline, then exit
     if let Some(pos) = args.iter().position(|a| a == "--dump-ast") {
         let cmd = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("");
-        print!("{}", cc_toolgate::parse::dump_ast(cmd));
+        match agent_shell_parser::parse::dump_ast(cmd) {
+            Ok(output) => print!("{}", output),
+            Err(e) => {
+                eprintln!("AST dump failed: {e}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
 

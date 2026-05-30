@@ -8,7 +8,7 @@
 //!
 //! # Architecture
 //!
-//! - **[`parse`]** — Shell parsing: tree-sitter-bash AST walker, shlex tokenizer, type definitions.
+//! - **`agent-shell-parser`** — Shell parsing: tree-sitter-bash AST walker, shlex tokenizer, type definitions (external crate).
 //! - **[`eval`]** — Evaluation engine: command registry, decision types, per-segment context.
 //! - **[`commands`]** — Command specs: per-tool evaluation logic (git, cargo, kubectl, gh, etc.).
 //! - **[`config`]** — Configuration loading: embedded defaults + user overlay merge.
@@ -22,8 +22,6 @@ pub mod config;
 pub mod eval;
 /// File-based decision logging.
 pub mod logging;
-/// Shell command parsing: tree-sitter AST, shlex tokenizer, pipeline types.
-pub mod parse;
 
 use eval::RuleMatch;
 

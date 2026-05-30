@@ -663,8 +663,8 @@ fn export_and_assign_before_redirect_segments_not_escalated() {
         "cat segment must be ASK (redirected), got: {reason}"
     );
     assert!(
-        reason.contains("escalated") && reason.contains("redirection"),
-        "cat escalation reason must mention redirection, got: {reason}"
+        reason.contains("output redirection"),
+        "cat reason must mention output redirection, got: {reason}"
     );
 }
 
