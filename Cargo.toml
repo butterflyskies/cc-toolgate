@@ -8,7 +8,7 @@ repository = "https://github.com/butterflyskies/cc-toolgate"
 readme = "README.md"
 keywords = ["claude-code", "hooks", "security", "shell", "toolgate"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.88"
+rust-version = "1.95"
 
 [dependencies]
 agent-shell-parser = "0.5.0"
