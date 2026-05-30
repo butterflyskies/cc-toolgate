@@ -7,6 +7,7 @@
 use super::super::CommandSpec;
 use crate::config::KubectlConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
+use agent_shell_parser::parse::Word;
 use std::collections::HashMap;
 
 /// Subcommand-aware kubectl evaluator.
@@ -40,11 +41,11 @@ impl KubectlSpec {
 
     /// Extract the kubectl subcommand (first non-flag word after "kubectl").
     /// Handles env var prefixes like `KUBECONFIG=~/.kube/staging kubectl apply`.
-    fn subcommand<'a>(ctx: &'a CommandContext) -> Option<&'a str> {
+    fn subcommand(ctx: &CommandContext) -> Option<&Word> {
         let mut iter = ctx.words.iter();
         for word in iter.by_ref() {
             if word == "kubectl" {
-                return iter.find(|w| !w.starts_with('-')).map(|s| s.as_str());
+                return iter.find(|w| !w.is_flag());
             }
         }
         None
@@ -60,13 +61,13 @@ impl KubectlSpec {
 
 impl CommandSpec for KubectlSpec {
     fn evaluate(&self, ctx: &CommandContext) -> RuleMatch {
-        let sub_str = Self::subcommand(ctx).unwrap_or("?");
+        let sub_str: &str = Self::subcommand(ctx).map(|w| w.as_str()).unwrap_or("?");
 
         if self.read_only.iter().any(|s| s == sub_str) {
             if let Some(ref r) = ctx.redirection {
                 return RuleMatch {
                     decision: Decision::Ask,
-                    reason: format!("kubectl {sub_str} with {}", r.description),
+                    reason: format!("kubectl {sub_str} with {}", r),
                 };
             }
             return RuleMatch {
@@ -81,7 +82,7 @@ impl CommandSpec for KubectlSpec {
                 if let Some(ref r) = ctx.redirection {
                     return RuleMatch {
                         decision: Decision::Ask,
-                        reason: format!("kubectl {sub_str} with {}", r.description),
+                        reason: format!("kubectl {sub_str} with {}", r),
                     };
                 }
                 return RuleMatch {

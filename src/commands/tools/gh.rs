@@ -40,7 +40,7 @@ impl GhSpec {
 
     /// Get the two-word subcommand (e.g. "pr list") and one-word fallback.
     /// Handles env var prefixes like `GH_TOKEN=abc gh pr create`.
-    fn subcommands(ctx: &CommandContext) -> (String, String) {
+    fn subcommands(ctx: &CommandContext) -> (String, &str) {
         // Find position of "gh" in the word list (may be preceded by env vars)
         let gh_pos = ctx.words.iter().position(|w| w == "gh");
         let after_gh = gh_pos.map(|p| p + 1).unwrap_or(1);
@@ -50,11 +50,7 @@ impl GhSpec {
         } else {
             String::new()
         };
-        let sub_one = ctx
-            .words
-            .get(after_gh)
-            .cloned()
-            .unwrap_or_else(|| "?".to_string());
+        let sub_one: &str = ctx.words.get(after_gh).map(|w| w.as_str()).unwrap_or("?");
         (sub_two, sub_one)
     }
 
@@ -71,12 +67,12 @@ impl CommandSpec for GhSpec {
         let (sub_two, sub_one) = Self::subcommands(ctx);
 
         let in_read_only = self.read_only.iter().any(|s| s == &sub_two)
-            || self.read_only.iter().any(|s| s == &sub_one);
+            || self.read_only.iter().any(|s| s == sub_one);
         if in_read_only {
             if let Some(ref r) = ctx.redirection {
                 return RuleMatch {
                     decision: Decision::Ask,
-                    reason: format!("gh {sub_one} with {}", r.description),
+                    reason: format!("gh {sub_one} with {}", r),
                 };
             }
             return RuleMatch {
@@ -87,13 +83,13 @@ impl CommandSpec for GhSpec {
 
         // Env-gated subcommands: allowed only when all config_env entries match
         let in_env_gated = self.allowed_with_config.iter().any(|s| s == &sub_two)
-            || self.allowed_with_config.iter().any(|s| s == &sub_one);
+            || self.allowed_with_config.iter().any(|s| s == sub_one);
         if in_env_gated {
             if !self.config_env.is_empty() && ctx.env_satisfies(&self.config_env) {
                 if let Some(ref r) = ctx.redirection {
                     return RuleMatch {
                         decision: Decision::Ask,
-                        reason: format!("gh {sub_one} with {}", r.description),
+                        reason: format!("gh {sub_one} with {}", r),
                     };
                 }
                 return RuleMatch {
@@ -108,7 +104,7 @@ impl CommandSpec for GhSpec {
         }
 
         let in_mutating = self.mutating.iter().any(|s| s == &sub_two)
-            || self.mutating.iter().any(|s| s == &sub_one);
+            || self.mutating.iter().any(|s| s == sub_one);
         if in_mutating {
             return RuleMatch {
                 decision: Decision::Ask,

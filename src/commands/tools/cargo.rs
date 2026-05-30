@@ -6,6 +6,7 @@
 use super::super::CommandSpec;
 use crate::config::CargoConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
+use agent_shell_parser::parse::Word;
 use std::collections::HashMap;
 
 /// Subcommand-aware cargo evaluator.
@@ -36,11 +37,11 @@ impl CargoSpec {
 
     /// Extract the cargo subcommand (first non-flag word after "cargo").
     /// Handles env var prefixes like `CARGO_INSTALL_ROOT=/tmp cargo install`.
-    fn subcommand<'a>(ctx: &'a CommandContext) -> Option<&'a str> {
+    fn subcommand(ctx: &CommandContext) -> Option<&Word> {
         let mut iter = ctx.words.iter();
         for word in iter.by_ref() {
             if word == "cargo" {
-                return iter.find(|w| !w.starts_with('-')).map(|s| s.as_str());
+                return iter.find(|w| !w.is_flag());
             }
         }
         None
@@ -56,13 +57,13 @@ impl CargoSpec {
 
 impl CommandSpec for CargoSpec {
     fn evaluate(&self, ctx: &CommandContext) -> RuleMatch {
-        let sub_str = Self::subcommand(ctx).unwrap_or("?");
+        let sub_str: &str = Self::subcommand(ctx).map(|w| w.as_str()).unwrap_or("?");
 
         if self.safe_subcommands.iter().any(|s| s == sub_str) {
             if let Some(ref r) = ctx.redirection {
                 return RuleMatch {
                     decision: Decision::Ask,
-                    reason: format!("cargo {sub_str} with {}", r.description),
+                    reason: format!("cargo {sub_str} with {}", r),
                 };
             }
             return RuleMatch {
@@ -77,7 +78,7 @@ impl CommandSpec for CargoSpec {
                 if let Some(ref r) = ctx.redirection {
                     return RuleMatch {
                         decision: Decision::Ask,
-                        reason: format!("cargo {sub_str} with {}", r.description),
+                        reason: format!("cargo {sub_str} with {}", r),
                     };
                 }
                 return RuleMatch {

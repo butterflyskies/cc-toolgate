@@ -17,8 +17,10 @@ use std::collections::HashMap;
 
 use crate::commands::CommandSpec;
 use crate::config::Config;
-use crate::parse;
-use crate::parse::Operator;
+use agent_shell_parser::parse;
+use agent_shell_parser::parse::{
+    CommandConfig, Operator, ParsedPipeline, ResolvedCommand, ShellSegment, WrapperSpec,
+};
 
 /// Check whether a command segment is likely to succeed unconditionally.
 ///
@@ -29,21 +31,22 @@ use crate::parse::Operator;
 ///
 /// This is intentionally conservative — returning false for an unknown command
 /// just means we won't accumulate its env vars, which is the safe default.
-fn is_likely_successful(segment: &str) -> bool {
+fn is_likely_successful(segment: &ShellSegment) -> bool {
     // Subshell substitutions make success unpredictable — the substituted
     // command could fail, changing the segment's exit code.
-    if segment.contains("__SUBST__") {
+    if !segment.substitutions.is_empty() {
         return false;
     }
-    let words = parse::tokenize(segment);
+    let words = &segment.words;
     if words.is_empty() {
         return false;
     }
     // Bare VAR=VALUE assignment (single token with `=`)
-    if words.len() == 1 && words[0].contains('=') {
-        return parse_assignment(&words[0]).is_some();
+    if words.len() == 1 && words[0].as_assignment().is_some() {
+        return true;
     }
-    let base = parse::base_command(segment);
+    // Use the first non-env-var word as the base command
+    let base = CommandContext::base_command_from_words(words);
     match base.as_str() {
         // export/unset with assignments is near-infallible
         "export" | "unset" => true,
@@ -64,43 +67,39 @@ fn is_var_name(s: &str) -> bool {
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
 }
 
-/// Try to parse a single `KEY=VALUE` token, returning (key, value) if valid.
-fn parse_assignment(token: &str) -> Option<(String, String)> {
-    let eq_pos = token.find('=')?;
-    let key = &token[..eq_pos];
-    let val = &token[eq_pos + 1..];
-    if is_var_name(key) {
-        Some((key.to_string(), val.to_string()))
-    } else {
-        None
-    }
-}
-
 /// Extract environment variable assignments from an `export` or bare assignment segment.
 ///
+/// Accepts pre-tokenized words (from `segment.words`).
+///
 /// Handles:
-/// - `export FOO=bar BAZ=qux` → [("FOO", "bar"), ("BAZ", "qux")]
-/// - `export FOO=bar` → [("FOO", "bar")]
-/// - `FOO=bar` (bare assignment, no command) → [("FOO", "bar")]
-/// - `export FOO` (no assignment) → []
-/// - `export -p` / `export -n FOO` → []
-fn extract_segment_env(segment: &str) -> Vec<(String, String)> {
-    let words = parse::tokenize(segment);
+/// - `["export", "FOO=bar", "BAZ=qux"]` → [("FOO", "bar"), ("BAZ", "qux")]
+/// - `["export", "FOO=bar"]` → [("FOO", "bar")]
+/// - `["FOO=bar"]` (bare assignment, no command) → [("FOO", "bar")]
+/// - `["export", "FOO"]` (no assignment) → []
+/// - `["export", "-p"]` / `["export", "-n", "FOO"]` → []
+fn extract_segment_env(words: &[parse::Word]) -> Vec<(String, String)> {
     if words.is_empty() {
         return Vec::new();
     }
 
     // Bare assignment: single token like "FOO=bar" (no command follows)
     if words.len() == 1 {
-        return parse_assignment(&words[0]).into_iter().collect();
+        return words[0]
+            .as_assignment()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .into_iter()
+            .collect();
     }
 
     // export command: extract KEY=VALUE pairs from arguments
     if words[0] == "export" {
         return words[1..]
             .iter()
-            .filter(|w| !w.starts_with('-')) // skip flags
-            .filter_map(|w| parse_assignment(w))
+            .filter(|w| !w.is_flag()) // skip flags
+            .filter_map(|w| {
+                w.as_assignment()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
             .collect();
     }
 
@@ -109,13 +108,14 @@ fn extract_segment_env(segment: &str) -> Vec<(String, String)> {
 
 /// Extract variable names from an `unset` command.
 ///
+/// Accepts pre-tokenized words (from `segment.words`).
+///
 /// Handles:
-/// - `unset FOO` → ["FOO"]
-/// - `unset FOO BAR` → ["FOO", "BAR"]
-/// - `unset -v FOO` → ["FOO"] (default behavior, unset variables)
-/// - `unset -f FOO` → [] (unsets functions, not variables)
-fn extract_unset_vars(segment: &str) -> Vec<String> {
-    let words = parse::tokenize(segment);
+/// - `["unset", "FOO"]` → ["FOO"]
+/// - `["unset", "FOO", "BAR"]` → ["FOO", "BAR"]
+/// - `["unset", "-v", "FOO"]` → ["FOO"] (default behavior, unset variables)
+/// - `["unset", "-f", "FOO"]` → [] (unsets functions, not variables)
+fn extract_unset_vars(words: &[parse::Word]) -> Vec<&str> {
     if words.is_empty() || words[0] != "unset" {
         return Vec::new();
     }
@@ -126,8 +126,8 @@ fn extract_unset_vars(segment: &str) -> Vec<String> {
             unsetting_functions = true;
         } else if word == "-v" {
             unsetting_functions = false;
-        } else if !word.starts_with('-') && !unsetting_functions && is_var_name(word) {
-            result.push(word.clone());
+        } else if !word.is_flag() && !unsetting_functions && is_var_name(word) {
+            result.push(word.as_str());
         }
     }
     result
@@ -145,6 +145,10 @@ pub struct CommandRegistry {
     /// These execute their arguments as subcommands and are handled
     /// separately from regular specs.
     wrappers: HashMap<String, Decision>,
+    /// Merged command config for `resolve_command_with`: agent-shell-parser's
+    /// default config extended with any cc-toolgate wrappers that aren't
+    /// already known to the parser.
+    resolve_config: CommandConfig,
     /// When true, DENY decisions are escalated to ASK.
     escalate_deny: bool,
     /// Path to the project overlay file that contributed to this config,
@@ -210,9 +214,16 @@ impl CommandRegistry {
             wrappers.insert(name.clone(), Decision::Ask);
         }
 
+        // Build a merged CommandConfig for resolve_command_with: start from
+        // agent-shell-parser's default config and add any cc-toolgate wrappers
+        // that aren't already known to the parser. This lets resolve_command_with
+        // handle ALL wrappers — no fallback flag-skipping needed.
+        let resolve_config = Self::build_resolve_config(&wrappers);
+
         Self {
             specs,
             wrappers,
+            resolve_config,
             escalate_deny: config.settings.escalate_deny,
             project_overlay_path: config.project_overlay_path.clone(),
         }
@@ -228,6 +239,35 @@ impl CommandRegistry {
         self.specs.get(name).map(|b| b.as_ref())
     }
 
+    /// Build a merged [`CommandConfig`] for `resolve_command_with`.
+    ///
+    /// Starts from agent-shell-parser's default config and adds a minimal
+    /// [`WrapperSpec`] for any cc-toolgate wrapper that isn't already known
+    /// to the parser. This ensures `resolve_command_with` can handle all
+    /// wrappers without a fallback code path.
+    fn build_resolve_config(wrappers: &HashMap<String, Decision>) -> CommandConfig {
+        let mut config = parse::default_command_config().clone();
+
+        for name in wrappers.keys() {
+            let already_known = config.wrappers.iter().any(|w| w.name == *name);
+            if !already_known {
+                // Add a minimal spec: skip leading flags, no value-consuming
+                // flags (conservative — may stop early, which is safe since
+                // the inner command gets evaluated anyway).
+                config.wrappers.push(WrapperSpec {
+                    name: name.clone(),
+                    short_value_flags: vec![],
+                    long_value_flags: vec![],
+                    unanalyzable_flags: vec![],
+                    skip_env_assignments: false,
+                    has_terminator: true,
+                    skip_positionals: 0,
+                });
+            }
+        }
+        config
+    }
+
     /// Check if a command is a wrapper; return its floor decision if so.
     fn wrapper_floor(&self, name: &str) -> Option<Decision> {
         self.wrappers.get(name).copied()
@@ -235,45 +275,26 @@ impl CommandRegistry {
 
     /// Extract the wrapped command from a wrapper invocation.
     ///
-    /// Skips the wrapper name and its flags, then returns the remaining
-    /// words joined as a command string. For `env`, also skips KEY=VALUE pairs.
-    fn extract_wrapped_command(ctx: &CommandContext) -> String {
-        let iter = ctx.words.iter().skip(1); // skip wrapper name
-
-        if ctx.base_command == "env" {
-            // env: skip flags AND KEY=VALUE pairs before the subcommand
-            let mut rest: Vec<&str> = Vec::new();
-            let mut found_cmd = false;
-            for word in iter {
-                if found_cmd {
-                    rest.push(word);
-                } else if word.starts_with('-') {
-                    continue; // skip flags
-                } else if word.contains('=') {
-                    continue; // skip KEY=VALUE
-                } else {
-                    found_cmd = true;
-                    rest.push(word);
-                }
+    /// Uses `resolve_command_with` with the merged config that includes both
+    /// agent-shell-parser's built-in wrappers and any cc-toolgate-only wrappers.
+    fn extract_wrapped_command(&self, ctx: &CommandContext) -> (String, bool) {
+        let resolved = parse::resolve_command_with(&ctx.words, &self.resolve_config);
+        match resolved {
+            ResolvedCommand::Resolved(ref parsed) if parsed.command != ctx.base_command => {
+                // Successfully stripped the wrapper — return the inner command
+                (parsed.to_words().join(" "), false)
             }
-            rest.join(" ")
-        } else {
-            // General case: skip flags (start with -), then collect the rest.
-            // Non-flag words before the actual command (like "10" in `nice -n 10 ls`)
-            // are flag values. We include them but base_command() in the recursive
-            // evaluate_single call will extract the first word, so we need to
-            // skip non-command words. We do this by skipping words that are purely
-            // numeric (common flag values like priority, timeout seconds, etc.).
-            let non_flags: Vec<&str> = iter
-                .skip_while(|w| w.starts_with('-'))
-                .map(|s| s.as_str())
-                .collect();
-            // Skip leading numeric-only words (flag values like "10", "30")
-            let cmd_start = non_flags
-                .iter()
-                .position(|w| !w.chars().all(|c| c.is_ascii_digit() || c == '.'))
-                .unwrap_or(non_flags.len());
-            non_flags[cmd_start..].join(" ")
+            ResolvedCommand::Resolved(_) => {
+                // resolve_command returned the same command (e.g. wrapper with
+                // no inner command, or wrapper not recognized despite config).
+                (String::new(), false)
+            }
+            ResolvedCommand::Unanalyzable(_) => {
+                // Unanalyzable (eval, source, shell -c) — signal to caller
+                (String::new(), true)
+            }
+            // Future variants: treat as unanalyzable (fail-closed)
+            _ => (String::new(), true),
         }
     }
 
@@ -302,49 +323,52 @@ impl CommandRegistry {
 
     /// Evaluate a single (non-compound) command against the registry.
     pub fn evaluate_single(&self, command: &str) -> RuleMatch {
-        let result = self.evaluate_single_with_env(command, &HashMap::new());
+        let ctx = CommandContext::from_command(command);
+        let result = self.evaluate_ctx(ctx);
         self.maybe_annotate_project_overlay(result)
     }
 
-    /// Evaluate a single command with accumulated environment from prior segments.
-    fn evaluate_single_with_env(
-        &self,
-        command: &str,
-        accumulated_env: &HashMap<String, String>,
-    ) -> RuleMatch {
-        let cmd = command.trim();
-        if cmd.is_empty() {
+    /// Evaluate a command context against the registry.
+    ///
+    /// This is the core evaluation method. All paths — simple commands,
+    /// compound segments, and wrapper-extracted inner commands — converge here.
+    fn evaluate_ctx(&self, ctx: CommandContext) -> RuleMatch {
+        // Bare variable assignments (e.g. "FOO=bar") are always safe.
+        // Check before the empty-command guard: a segment like "VAR=$(cmd)"
+        // has base_command="" (the token is parsed as an env var with no
+        // command), but it's a valid assignment, not an empty command.
+        if ctx.words.len() == 1 && ctx.words[0].as_assignment().is_some() {
+            return RuleMatch {
+                decision: Decision::Allow,
+                reason: format!("variable assignment: {}", ctx.words[0]),
+            };
+        }
+
+        if ctx.base_command.is_empty() {
             return RuleMatch {
                 decision: Decision::Allow,
                 reason: "empty".into(),
             };
         }
 
-        // Bare variable assignments (e.g. "FOO=bar") are always safe.
-        let words = parse::tokenize(cmd);
-        if words.len() == 1 && parse_assignment(&words[0]).is_some() {
-            return RuleMatch {
-                decision: Decision::Allow,
-                reason: format!("variable assignment: {}", words[0]),
-            };
-        }
-
-        let mut ctx = CommandContext::from_command(cmd);
-        ctx.accumulated_env = accumulated_env.clone();
-
-        // Wrapper commands: execute their arguments as a subcommand.
-        // Extract the wrapped command, evaluate it, return max(floor, inner).
+        // Wrapper commands: extract inner command, evaluate it, return max(floor, inner).
         if let Some(floor) = self.wrapper_floor(&ctx.base_command) {
-            let wrapped_cmd = Self::extract_wrapped_command(&ctx);
+            let (wrapped_cmd, is_unanalyzable) = self.extract_wrapped_command(&ctx);
             let mut strictest = floor;
-            let mut reason = if !wrapped_cmd.is_empty() {
+            let mut reason = if is_unanalyzable {
+                // Unanalyzable (eval, source, shell -c) → ASK
+                strictest = Decision::Ask;
+                format!("{} wraps unanalyzable command", ctx.base_command)
+            } else if !wrapped_cmd.is_empty() {
                 // env -i / env - clears the environment for the wrapped command.
                 let inner_env = if ctx.base_command == "env" && ctx.has_any_flag(&["-i", "-"]) {
                     HashMap::new()
                 } else {
-                    accumulated_env.clone()
+                    ctx.accumulated_env.clone()
                 };
-                let inner = self.evaluate_single_with_env(&wrapped_cmd, &inner_env);
+                let mut inner_ctx = CommandContext::from_command(&wrapped_cmd);
+                inner_ctx.accumulated_env = inner_env;
+                let inner = self.evaluate_ctx(inner_ctx);
                 if inner.decision > strictest {
                     strictest = inner.decision;
                 }
@@ -383,47 +407,40 @@ impl CommandRegistry {
         }
     }
 
-    /// Evaluate a full command string, handling compound expressions and substitutions.
-    pub fn evaluate(&self, command: &str) -> RuleMatch {
-        let (pipeline, substitutions) = parse::parse_with_substitutions(command);
-
-        // Simple case: no substitutions, not compound, and the segment text matches
-        // the original command → evaluate directly.  When the parser extracts a
-        // sub-range (e.g. a loop body), the segment text differs from the original
-        // and we must fall through to compound evaluation so the inner command is
-        // evaluated against actual rules instead of the enclosing keyword.
-        if pipeline.segments.len() <= 1 && substitutions.is_empty() {
-            let is_passthrough = match pipeline.segments.first() {
-                Some(seg) => seg.command.trim() == command.trim(),
-                None => true,
-            };
-            if is_passthrough {
-                return self.evaluate_single(command);
-            }
-        }
-
+    /// Recursively evaluate a pipeline tree, collecting substitution results.
+    ///
+    /// This is the recursive tree walk that replaces the old flat substitution loop.
+    /// For each segment, we first evaluate its substitutions, then the segment itself.
+    /// Structural substitutions (for-loop values, case subjects) are evaluated first.
+    fn evaluate_pipeline(
+        &self,
+        pipeline: &ParsedPipeline,
+        accumulated_env: &mut HashMap<String, String>,
+        reasons: &mut Vec<String>,
+    ) -> Decision {
         let mut strictest = Decision::Allow;
-        let mut reasons = Vec::new();
 
-        // Recursively evaluate substitution contents
-        for inner in &substitutions {
-            let result = self.evaluate(inner);
-            let label: String = inner.trim().chars().take(60).collect();
+        // Evaluate structural substitutions first (for-loop values, case subjects)
+        for sub in &pipeline.structural_substitutions {
+            let sub_decision = self.evaluate_pipeline(&sub.pipeline, &mut HashMap::new(), reasons);
+            let label: String = sub
+                .pipeline
+                .segments
+                .iter()
+                .map(|s| s.command.as_str())
+                .collect::<Vec<_>>()
+                .join(" && ");
+            let label: String = label.trim().chars().take(60).collect();
             reasons.push(format!(
-                "  subst[$({label})] -> {}: {}",
-                result.decision.label(),
-                result.reason
+                "  structural-subst[$({label})] -> {}: (nested)",
+                sub_decision.label(),
             ));
-            if result.decision > strictest {
-                strictest = result.decision;
+            if sub_decision > strictest {
+                strictest = sub_decision;
             }
         }
 
-        // Evaluate each part of the (possibly compound) outer command,
-        // accumulating environment variables from export/assignment segments.
-        let mut accumulated_env: HashMap<String, String> = HashMap::new();
-        // Whether the current segment is known to execute (for env accumulation).
-        // The first segment always executes.
+        // Evaluate each segment with its substitutions
         let mut segment_executes = true;
 
         for (i, segment) in pipeline.segments.iter().enumerate() {
@@ -435,43 +452,70 @@ impl CommandRegistry {
                     Operator::Semi => segment_executes = true,
                     // And: segment executes only if prior executed AND succeeded.
                     Operator::And => {
-                        segment_executes = segment_executes
-                            && is_likely_successful(&pipeline.segments[i - 1].command);
+                        segment_executes =
+                            segment_executes && is_likely_successful(&pipeline.segments[i - 1]);
                     }
-                    // Or / Pipe / PipeErr: can't guarantee execution or env propagation.
-                    // Clear accumulated env: after || the prior segment succeeded
-                    // (so this one is skipped) or failed (so its env isn't set).
-                    // After | the left side runs in a subshell.
-                    Operator::Or | Operator::Pipe | Operator::PipeErr => {
+                    // Or / Pipe / PipeErr / Background: can't guarantee execution or env propagation.
+                    Operator::Or | Operator::Pipe | Operator::PipeErr | Operator::Background => {
+                        segment_executes = false;
+                        accumulated_env.clear();
+                    }
+                    // Future operator variants: conservative behavior
+                    _ => {
                         segment_executes = false;
                         accumulated_env.clear();
                     }
                 }
             }
 
-            let mut result = self.evaluate_single_with_env(&segment.command, &accumulated_env);
-
-            // Accumulate env vars from this segment if it's known to execute.
-            // Also remove any vars that are explicitly unset.
-            if segment_executes {
-                for (key, val) in extract_segment_env(&segment.command) {
-                    accumulated_env.insert(key, val);
-                }
-                for var in extract_unset_vars(&segment.command) {
-                    accumulated_env.remove(&var);
+            // Evaluate substitutions within this segment (recursive tree walk).
+            // Substitutions don't propagate env to parent — use a fresh env.
+            for sub in &segment.substitutions {
+                let sub_decision =
+                    self.evaluate_pipeline(&sub.pipeline, &mut HashMap::new(), reasons);
+                // Build a readable label from the substitution's inner pipeline segments
+                let label: String = sub
+                    .pipeline
+                    .segments
+                    .iter()
+                    .map(|s| s.command.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" && ");
+                let label: String = label.trim().chars().take(60).collect();
+                reasons.push(format!(
+                    "  subst[$({label})] -> {}: (nested)",
+                    sub_decision.label(),
+                ));
+                if sub_decision > strictest {
+                    strictest = sub_decision;
                 }
             }
 
-            // Propagate redirection from wrapping constructs (e.g. a for loop
-            // with output redirection: `for ... done > file`).  The inner
-            // command text won't contain the redirect, so evaluate_single
-            // can't see it — escalate here.
+            // Build a CommandContext from the structured segment — uses the
+            // pre-tokenized words from tree-sitter directly.
+            let mut ctx = CommandContext::from_segment(segment);
+            ctx.accumulated_env = accumulated_env.clone();
+
+            let mut result = self.evaluate_ctx(ctx);
+
+            // Accumulate env vars from this segment if it's known to execute.
+            // Use the segment's pre-tokenized words directly (substitutions
+            // are already evaluated separately via the recursive tree walk).
+            if segment_executes {
+                for (key, val) in extract_segment_env(&segment.words) {
+                    accumulated_env.insert(key, val);
+                }
+                for var in extract_unset_vars(&segment.words) {
+                    accumulated_env.remove(var);
+                }
+            }
+
+            // Propagate redirection from wrapping constructs
             if result.decision == Decision::Allow
                 && let Some(ref r) = segment.redirection
             {
                 result.decision = Decision::Ask;
-                result.reason =
-                    format!("{} (escalated: wrapping {})", result.reason, r.description);
+                result.reason = format!("{} (escalated: wrapping {})", result.reason, r);
             }
             let label: String = segment.command.trim().chars().take(60).collect();
             reasons.push(format!(
@@ -484,6 +528,69 @@ impl CommandRegistry {
             }
         }
 
+        strictest
+    }
+
+    /// Evaluate a full command string, handling compound expressions and substitutions.
+    pub fn evaluate(&self, command: &str) -> RuleMatch {
+        let pipeline = match parse::parse_with_substitutions(command) {
+            Ok(p) => p,
+            Err(_) => {
+                // ParseError → ASK (fail-closed)
+                return RuleMatch {
+                    decision: Decision::Ask,
+                    reason: "parse error (fail-closed)".into(),
+                };
+            }
+        };
+
+        // Check for parse errors in the pipeline tree → ASK (fail-closed)
+        if pipeline.has_parse_errors_recursive() {
+            // Still evaluate what we can, but escalate to ASK minimum
+            let mut strictest = Decision::Ask;
+            let mut reasons = vec!["  parse errors detected (fail-closed)".to_string()];
+            let mut accumulated_env: HashMap<String, String> = HashMap::new();
+            let tree_decision =
+                self.evaluate_pipeline(&pipeline, &mut accumulated_env, &mut reasons);
+            if tree_decision > strictest {
+                strictest = tree_decision;
+            }
+            return RuleMatch {
+                decision: strictest,
+                reason: format!(
+                    "compound command (parse errors, fail-closed):\n{}",
+                    reasons.join("\n")
+                ),
+            };
+        }
+
+        // Simple case: no substitutions, not compound, and the segment text matches
+        // the original command → evaluate directly.
+        let has_substitutions = pipeline
+            .find_segment(&|seg| {
+                if !seg.substitutions.is_empty() {
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .is_some()
+            || !pipeline.structural_substitutions.is_empty();
+
+        if pipeline.segments.len() <= 1 && !has_substitutions {
+            let is_passthrough = match pipeline.segments.first() {
+                Some(seg) => seg.command.trim() == command.trim(),
+                None => true,
+            };
+            if is_passthrough {
+                return self.evaluate_single(command);
+            }
+        }
+
+        let mut reasons = Vec::new();
+        let mut accumulated_env: HashMap<String, String> = HashMap::new();
+        let strictest = self.evaluate_pipeline(&pipeline, &mut accumulated_env, &mut reasons);
+
         // Build summary header
         let mut desc = Vec::new();
         if !pipeline.operators.is_empty() {
@@ -492,8 +599,17 @@ impl CommandRegistry {
             unique_ops.dedup();
             desc.push(unique_ops.join(", "));
         }
-        if !substitutions.is_empty() {
-            desc.push(format!("{} substitution(s)", substitutions.len()));
+        if has_substitutions {
+            let sub_count = pipeline.filter_segments(&|seg| {
+                if !seg.substitutions.is_empty() {
+                    Some(seg.substitutions.len())
+                } else {
+                    None
+                }
+            });
+            let total: usize =
+                sub_count.iter().sum::<usize>() + pipeline.structural_substitutions.len();
+            desc.push(format!("{total} substitution(s)"));
         }
         let header = if desc.is_empty() {
             "compound command".into()
@@ -509,556 +625,4 @@ impl CommandRegistry {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Clear `GIT_CONFIG_GLOBAL` from the process environment so the
-    /// env-gate fallback in `env_satisfies` doesn't interfere.  Requires nextest.
-    fn clear_git_env() {
-        assert!(
-            std::env::var("NEXTEST").is_ok(),
-            "this test mutates process env and requires nextest (cargo nextest run)"
-        );
-        unsafe { std::env::remove_var("GIT_CONFIG_GLOBAL") };
-    }
-
-    // ── is_likely_successful ──
-
-    #[test]
-    fn likely_success_export() {
-        assert!(is_likely_successful("export FOO=bar"));
-    }
-
-    #[test]
-    fn likely_success_export_multiple() {
-        assert!(is_likely_successful("export A=1 B=2"));
-    }
-
-    #[test]
-    fn likely_success_bare_assignment() {
-        assert!(is_likely_successful("FOO=bar"));
-    }
-
-    #[test]
-    fn likely_success_true() {
-        assert!(is_likely_successful("true"));
-    }
-
-    #[test]
-    fn likely_success_echo() {
-        assert!(is_likely_successful("echo hello"));
-    }
-
-    #[test]
-    fn likely_success_printf() {
-        assert!(is_likely_successful("printf '%s\\n' hello"));
-    }
-
-    #[test]
-    fn likely_success_export_with_subshell_is_not_likely() {
-        // export FOO=$(cmd) — the substitution could fail
-        assert!(!is_likely_successful("export FOO=__SUBST__"));
-    }
-
-    #[test]
-    fn likely_success_echo_with_subshell_is_not_likely() {
-        assert!(!is_likely_successful("echo __SUBST__"));
-    }
-
-    #[test]
-    fn likely_success_bare_assignment_with_subshell_is_not_likely() {
-        assert!(!is_likely_successful("FOO=__SUBST__"));
-    }
-
-    #[test]
-    fn likely_success_unknown_command() {
-        assert!(!is_likely_successful("some_command --flag"));
-    }
-
-    #[test]
-    fn likely_success_git() {
-        assert!(!is_likely_successful("git push"));
-    }
-
-    #[test]
-    fn likely_success_rm() {
-        assert!(!is_likely_successful("rm -rf /"));
-    }
-
-    // ── extract_segment_env ──
-
-    #[test]
-    fn extract_env_export_single() {
-        let vars = extract_segment_env("export FOO=bar");
-        assert_eq!(vars, vec![("FOO".into(), "bar".into())]);
-    }
-
-    #[test]
-    fn extract_env_export_multiple() {
-        let vars = extract_segment_env("export A=1 B=2");
-        assert_eq!(
-            vars,
-            vec![("A".into(), "1".into()), ("B".into(), "2".into())]
-        );
-    }
-
-    #[test]
-    fn extract_env_export_with_path() {
-        let vars = extract_segment_env("export GIT_CONFIG_GLOBAL=~/.gitconfig.ai");
-        assert_eq!(
-            vars,
-            vec![("GIT_CONFIG_GLOBAL".into(), "~/.gitconfig.ai".into())]
-        );
-    }
-
-    #[test]
-    fn extract_env_bare_assignment() {
-        let vars = extract_segment_env("FOO=bar");
-        assert_eq!(vars, vec![("FOO".into(), "bar".into())]);
-    }
-
-    #[test]
-    fn extract_env_export_no_value() {
-        // `export FOO` (no =) should not extract anything
-        let vars = extract_segment_env("export FOO");
-        assert!(vars.is_empty());
-    }
-
-    #[test]
-    fn extract_env_export_flags() {
-        let vars = extract_segment_env("export -p");
-        assert!(vars.is_empty());
-    }
-
-    #[test]
-    fn extract_env_non_export() {
-        let vars = extract_segment_env("git push");
-        assert!(vars.is_empty());
-    }
-
-    // ── Compound command env accumulation (end-to-end via registry) ──
-
-    /// Build a registry with git config_env gating enabled.
-    fn registry_with_git_env_gate() -> CommandRegistry {
-        let mut config = crate::config::Config::default_config();
-        config.git.allowed_with_config = vec!["push".into(), "commit".into(), "add".into()];
-        config
-            .git
-            .config_env
-            .insert("GIT_CONFIG_GLOBAL".into(), "~/.gitconfig.ai".into());
-        CommandRegistry::from_config(&config)
-    }
-
-    #[test]
-    fn export_semicolon_git_push_allows() {
-        let reg = registry_with_git_env_gate();
-        let result =
-            reg.evaluate("export GIT_CONFIG_GLOBAL=~/.gitconfig.ai ; git push origin main");
-        assert_eq!(
-            result.decision,
-            Decision::Allow,
-            "reason: {}",
-            result.reason
-        );
-    }
-
-    #[test]
-    fn export_and_git_push_allows() {
-        let reg = registry_with_git_env_gate();
-        let result =
-            reg.evaluate("export GIT_CONFIG_GLOBAL=~/.gitconfig.ai && git push origin main");
-        assert_eq!(
-            result.decision,
-            Decision::Allow,
-            "reason: {}",
-            result.reason
-        );
-    }
-
-    #[test]
-    fn multiple_exports_and_git_push_allows() {
-        let reg = registry_with_git_env_gate();
-        let result = reg.evaluate(
-            "export PATH=/usr/bin && export GIT_CONFIG_GLOBAL=~/.gitconfig.ai && git push origin main",
-        );
-        assert_eq!(
-            result.decision,
-            Decision::Allow,
-            "reason: {}",
-            result.reason
-        );
-    }
-
-    #[test]
-    fn export_or_git_push_does_not_allow() {
-        clear_git_env();
-        // || means git push runs only if export failed → env not set
-        let reg = registry_with_git_env_gate();
-        let result =
-            reg.evaluate("export GIT_CONFIG_GLOBAL=~/.gitconfig.ai || git push origin main");
-        assert_eq!(result.decision, Decision::Ask, "reason: {}", result.reason);
-    }
-
-    #[test]
-    fn export_pipe_git_push_does_not_allow() {
-        clear_git_env();
-        // | means subshell boundary → env doesn't propagate
-        let reg = registry_with_git_env_gate();
-        let result =
-            reg.evaluate("export GIT_CONFIG_GLOBAL=~/.gitconfig.ai | git push origin main");
-        assert_eq!(result.decision, Decision::Ask, "reason: {}", result.reason);
-    }
-
-    #[test]
-    fn unknown_cmd_breaks_and_chain() {
-        // unknown_cmd is not is_likely_successful, so && chain breaks
-        let reg = registry_with_git_env_gate();
-        let result = reg.evaluate(
-            "export GIT_CONFIG_GLOBAL=~/.gitconfig.ai && unknown_cmd && git push origin main",
-        );
-        assert_eq!(result.decision, Decision::Ask, "reason: {}", result.reason);
-    }
-
-    #[test]
-    fn semicolon_after_unknown_cmd_resumes_accumulation() {
-        // ; resets segment_executes to true, so export after ; is accumulated
-        let reg = registry_with_git_env_gate();
-        let result = reg.evaluate(
-            "unknown_cmd ; export GIT_CONFIG_GLOBAL=~/.gitconfig.ai ; git push origin main",
-        );
-        assert_eq!(result.decision, Decision::Ask, "reason: {}", result.reason);
-        // Note: still ASK because unknown_cmd itself is ASK (unrecognized),
-        // and strictest-wins. Let's verify the git push part specifically.
-    }
-
-    #[test]
-    fn semicolon_resumes_accumulation_all_known() {
-        // echo is allowed AND likely_successful. After ;, export accumulates.
-        let reg = registry_with_git_env_gate();
-        let result = reg.evaluate(
-            "echo starting ; export GIT_CONFIG_GLOBAL=~/.gitconfig.ai ; git push origin main",
-        );
-        assert_eq!(
-            result.decision,
-            Decision::Allow,
-            "reason: {}",
-            result.reason
-        );
-    }
-
-    #[test]
-    fn bare_assignment_semicolon_git_push_allows() {
-        let reg = registry_with_git_env_gate();
-        let result = reg.evaluate("GIT_CONFIG_GLOBAL=~/.gitconfig.ai ; git push origin main");
-        assert_eq!(
-            result.decision,
-            Decision::Allow,
-            "reason: {}",
-            result.reason
-        );
-    }
-
-    #[test]
-    fn bare_assignment_and_git_push_allows() {
-        let reg = registry_with_git_env_gate();
-        let result = reg.evaluate("GIT_CONFIG_GLOBAL=~/.gitconfig.ai && git push origin main");
-        assert_eq!(
-            result.decision,
-            Decision::Allow,
-            "reason: {}",
-            result.reason
-        );
-    }
-
-    #[test]
-    fn wrong_export_value_still_asks() {
-        let reg = registry_with_git_env_gate();
-        let result =
-            reg.evaluate("export GIT_CONFIG_GLOBAL=~/.gitconfig.wrong && git push origin main");
-        assert_eq!(result.decision, Decision::Ask, "reason: {}", result.reason);
-    }
-
-    #[test]
-    fn export_overridden_by_later_export() {
-        let reg = registry_with_git_env_gate();
-        // First export sets wrong value, second corrects it
-        let result = reg.evaluate(
-            "export GIT_CONFIG_GLOBAL=wrong ; export GIT_CONFIG_GLOBAL=~/.gitconfig.ai ; git push origin main",
-        );
-        assert_eq!(
-            result.decision,
-            Decision::Allow,
-            "reason: {}",
-            result.reason
-        );
-    }
-
-    #[test]
-    fn or_after_export_clears_accumulated_env() {
-        clear_git_env();
-        // export A=1 && echo ok || export B=2 && git push
-        // The || clears accumulated env (conservative: can't determine which
-        // path was taken). git push doesn't see GIT_CONFIG_GLOBAL.
-        let reg = registry_with_git_env_gate();
-        let result = reg.evaluate(
-            "export GIT_CONFIG_GLOBAL=~/.gitconfig.ai && echo ok || export OTHER=x && git push origin main",
-        );
-        assert_eq!(result.decision, Decision::Ask, "reason: {}", result.reason);
-    }
-
-    #[test]
-    fn echo_and_export_and_git_push_allows() {
-        // echo is likely_successful, export is likely_successful, chain holds
-        let reg = registry_with_git_env_gate();
-        let result = reg.evaluate(
-            "echo 'Pushing...' && export GIT_CONFIG_GLOBAL=~/.gitconfig.ai && git push origin main",
-        );
-        assert_eq!(
-            result.decision,
-            Decision::Allow,
-            "reason: {}",
-            result.reason
-        );
-    }
-
-    #[test]
-    fn realistic_claude_pattern() {
-        // The actual pattern Claude generates
-        let reg = registry_with_git_env_gate();
-        let result = reg.evaluate(
-            "export PATH=/home/user/.cargo/bin:/usr/bin && export GIT_CONFIG_GLOBAL=~/.gitconfig.ai && echo 'Pushing...' && git push -u origin feature-branch",
-        );
-        assert_eq!(
-            result.decision,
-            Decision::Allow,
-            "reason: {}",
-            result.reason
-        );
-    }
-
-    #[test]
-    fn force_push_still_asks_with_export() {
-        // Force push flags should escalate even with correct env
-        let reg = registry_with_git_env_gate();
-        let result = reg
-            .evaluate("export GIT_CONFIG_GLOBAL=~/.gitconfig.ai && git push --force origin main");
-        assert_eq!(result.decision, Decision::Ask, "reason: {}", result.reason);
-    }
-
-    #[test]
-    fn subshell_in_export_breaks_and_chain() {
-        // export FOO=$(cmd) && git push — subshell makes export's success unpredictable,
-        // so the && chain can't guarantee the next segment executes.
-        let reg = registry_with_git_env_gate();
-        let result = reg.evaluate(
-            "export GIT_CONFIG_GLOBAL=$(cat ~/.gitconfig.ai.path) && git push origin main",
-        );
-        assert_eq!(result.decision, Decision::Ask, "reason: {}", result.reason);
-    }
-
-    #[test]
-    fn subshell_in_echo_breaks_and_chain() {
-        // echo $(cmd) && export FOO=bar && git push — echo with subshell is not
-        // likely successful, breaking the chain for subsequent accumulation.
-        let reg = registry_with_git_env_gate();
-        let result = reg.evaluate(
-            "echo $(some_status_cmd) && export GIT_CONFIG_GLOBAL=~/.gitconfig.ai && git push origin main",
-        );
-        assert_eq!(result.decision, Decision::Ask, "reason: {}", result.reason);
-    }
-
-    // ── unset ──
-
-    #[test]
-    fn unset_removes_accumulated_var() {
-        clear_git_env();
-        let reg = registry_with_git_env_gate();
-        let result = reg.evaluate(
-            "export GIT_CONFIG_GLOBAL=~/.gitconfig.ai ; unset GIT_CONFIG_GLOBAL ; git push origin main",
-        );
-        assert_eq!(result.decision, Decision::Ask, "reason: {}", result.reason);
-    }
-
-    #[test]
-    fn unset_only_removes_named_var() {
-        let reg = registry_with_git_env_gate();
-        let result = reg.evaluate(
-            "export GIT_CONFIG_GLOBAL=~/.gitconfig.ai ; unset OTHER_VAR ; git push origin main",
-        );
-        assert_eq!(
-            result.decision,
-            Decision::Allow,
-            "reason: {}",
-            result.reason
-        );
-    }
-
-    #[test]
-    fn unset_f_does_not_remove_var() {
-        // unset -f removes functions, not variables
-        let reg = registry_with_git_env_gate();
-        let result = reg.evaluate(
-            "export GIT_CONFIG_GLOBAL=~/.gitconfig.ai ; unset -f GIT_CONFIG_GLOBAL ; git push origin main",
-        );
-        assert_eq!(
-            result.decision,
-            Decision::Allow,
-            "reason: {}",
-            result.reason
-        );
-    }
-
-    // ── extract_unset_vars ──
-
-    #[test]
-    fn extract_unset_single() {
-        assert_eq!(extract_unset_vars("unset FOO"), vec!["FOO"]);
-    }
-
-    #[test]
-    fn extract_unset_multiple() {
-        assert_eq!(extract_unset_vars("unset FOO BAR"), vec!["FOO", "BAR"]);
-    }
-
-    #[test]
-    fn extract_unset_with_v_flag() {
-        assert_eq!(extract_unset_vars("unset -v FOO"), vec!["FOO"]);
-    }
-
-    #[test]
-    fn extract_unset_with_f_flag() {
-        let result = extract_unset_vars("unset -f my_func");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn extract_unset_mixed_flags() {
-        // -f disables var unset, -v re-enables it
-        assert_eq!(
-            extract_unset_vars("unset -f my_func -v MY_VAR"),
-            vec!["MY_VAR"]
-        );
-    }
-
-    #[test]
-    fn extract_unset_not_unset_cmd() {
-        assert!(extract_unset_vars("export FOO=bar").is_empty());
-    }
-
-    // ── env -i wrapper ──
-
-    #[test]
-    fn env_i_clears_accumulated_env_for_wrapped_cmd() {
-        clear_git_env();
-        let reg = registry_with_git_env_gate();
-        let result =
-            reg.evaluate("export GIT_CONFIG_GLOBAL=~/.gitconfig.ai ; env -i git push origin main");
-        assert_eq!(result.decision, Decision::Ask, "reason: {}", result.reason);
-    }
-
-    #[test]
-    fn env_dash_clears_accumulated_env_for_wrapped_cmd() {
-        clear_git_env();
-        let reg = registry_with_git_env_gate();
-        let result =
-            reg.evaluate("export GIT_CONFIG_GLOBAL=~/.gitconfig.ai ; env - git push origin main");
-        assert_eq!(result.decision, Decision::Ask, "reason: {}", result.reason);
-    }
-
-    #[test]
-    fn env_without_i_passes_accumulated_env() {
-        let reg = registry_with_git_env_gate();
-        let result =
-            reg.evaluate("export GIT_CONFIG_GLOBAL=~/.gitconfig.ai ; env git push origin main");
-        assert_eq!(
-            result.decision,
-            Decision::Allow,
-            "reason: {}",
-            result.reason
-        );
-    }
-
-    // ── Project overlay consent annotation ──
-
-    /// Build a registry with a project overlay path set.
-    fn registry_with_project_overlay() -> CommandRegistry {
-        let mut config = crate::config::Config::default_config();
-        config.project_overlay_path = Some(std::path::PathBuf::from(
-            "/fake/repo/.claude/cc-toolgate.toml",
-        ));
-        CommandRegistry::from_config(&config)
-    }
-
-    #[test]
-    fn ask_decision_annotated_with_project_overlay_path() {
-        let reg = registry_with_project_overlay();
-        // "curl" is in the default ask list — should produce ASK with annotation
-        let result = reg.evaluate_single("curl https://example.com");
-        assert_eq!(result.decision, Decision::Ask);
-        assert!(
-            result.reason.contains("project config at"),
-            "ASK reason should mention project config; got: {}",
-            result.reason
-        );
-        assert!(
-            result
-                .reason
-                .contains("/fake/repo/.claude/cc-toolgate.toml"),
-            "ASK reason should include overlay path; got: {}",
-            result.reason
-        );
-    }
-
-    #[test]
-    fn allow_decision_not_annotated_with_project_overlay_path() {
-        let reg = registry_with_project_overlay();
-        // "ls" is in the default allow list — should NOT have annotation
-        let result = reg.evaluate_single("ls -la");
-        assert_eq!(result.decision, Decision::Allow);
-        assert!(
-            !result.reason.contains("project config at"),
-            "ALLOW reason should not mention project config; got: {}",
-            result.reason
-        );
-    }
-
-    #[test]
-    fn deny_decision_not_annotated_with_project_overlay_path() {
-        let reg = registry_with_project_overlay();
-        // "shred" is in the default deny list — DENY should NOT have annotation
-        let result = reg.evaluate_single("shred /etc/passwd");
-        assert_eq!(result.decision, Decision::Deny);
-        assert!(
-            !result.reason.contains("project config at"),
-            "DENY reason should not mention project config; got: {}",
-            result.reason
-        );
-    }
-
-    #[test]
-    fn no_annotation_without_project_overlay() {
-        // Registry without project overlay — no annotation on ASK
-        let config = crate::config::Config::default_config();
-        let reg = CommandRegistry::from_config(&config);
-        let result = reg.evaluate_single("curl https://example.com");
-        assert_eq!(result.decision, Decision::Ask);
-        assert!(
-            !result.reason.contains("project config at"),
-            "without project overlay, reason should not mention project config; got: {}",
-            result.reason
-        );
-    }
-
-    #[test]
-    fn compound_ask_decision_annotated_with_project_overlay() {
-        let reg = registry_with_project_overlay();
-        // Compound command where one segment is ASK
-        let result = reg.evaluate("ls -la ; curl https://example.com");
-        assert_eq!(result.decision, Decision::Ask);
-        assert!(
-            result.reason.contains("project config at"),
-            "compound ASK reason should mention project config; got: {}",
-            result.reason
-        );
-    }
-}
+mod tests;

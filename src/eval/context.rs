@@ -1,16 +1,14 @@
 //! Per-segment command context: tokenization, env var extraction, and redirection detection.
 
-use crate::parse::Redirection;
+use agent_shell_parser::parse::{Redirection, ShellSegment, Word};
 
 /// Context for evaluating a single command segment.
 #[derive(Debug)]
-pub struct CommandContext<'a> {
-    /// The full command text of this segment.
-    pub raw: &'a str,
+pub struct CommandContext {
     /// The base command name (e.g. "git", "ls", "cargo").
     pub base_command: String,
-    /// All words in the command (tokenized via shlex).
-    pub words: Vec<String>,
+    /// All words in the command (pre-tokenized by tree-sitter or shlex).
+    pub words: Vec<Word>,
     /// Leading KEY=VALUE environment variable assignments.
     pub env_vars: Vec<(String, String)>,
     /// Detected output redirection, if any.
@@ -20,22 +18,98 @@ pub struct CommandContext<'a> {
     pub accumulated_env: std::collections::HashMap<String, String>,
 }
 
-impl<'a> CommandContext<'a> {
+impl CommandContext {
     /// Build a CommandContext from a raw command string.
-    pub fn from_command(raw: &'a str) -> Self {
-        let base_command = crate::parse::base_command(raw);
-        let env_vars = crate::parse::env_vars(raw);
-        let words = crate::parse::tokenize(raw);
-        let redirection = crate::parse::has_output_redirection(raw);
+    ///
+    /// Used for simple (non-compound) command evaluation and in tests.
+    pub fn from_command(raw: &str) -> Self {
+        let base_command = agent_shell_parser::parse::base_command(raw);
+        let env_vars = agent_shell_parser::parse::env_vars(raw);
+        let words = agent_shell_parser::parse::tokenize(raw);
+        // has_output_redirection now returns Result. On error, assume redirection
+        // exists (conservative — fail-closed).
+        let redirection = agent_shell_parser::parse::has_output_redirection(raw).unwrap_or(Some(
+            agent_shell_parser::parse::Redirection {
+                operator: ">",
+                fd: None,
+                target: "(parse error)".into(),
+            },
+        ));
 
         Self {
-            raw,
             base_command,
             words,
             env_vars,
             redirection,
             accumulated_env: std::collections::HashMap::new(),
         }
+    }
+
+    /// Build a CommandContext from a parsed [`ShellSegment`].
+    ///
+    /// Uses the segment's pre-tokenized `words` field directly — tree-sitter
+    /// already handles word boundaries correctly, including preserving
+    /// substitution syntax (`$(...)`, backticks) as single tokens.
+    ///
+    /// Redirection is detected by parsing the segment's command text (inline
+    /// redirections like `cat > file`) or inherited from the segment's
+    /// `redirection` field (wrapping-construct redirections like `for ... done > file`).
+    pub fn from_segment(segment: &ShellSegment) -> Self {
+        let words = segment.words.clone();
+        let base_command = Self::base_command_from_words(&words);
+        let env_vars = Self::env_vars_from_words(&words);
+        // Detect inline redirections from the command text, falling back to
+        // the segment's wrapping-construct redirection if present.
+        let redirection = match agent_shell_parser::parse::has_output_redirection(&segment.command)
+        {
+            Ok(r) => r.or_else(|| segment.redirection.clone()),
+            Err(_) => {
+                segment
+                    .redirection
+                    .clone()
+                    .or(Some(agent_shell_parser::parse::Redirection {
+                        operator: ">",
+                        fd: None,
+                        target: "(parse error)".into(),
+                    }))
+            }
+        };
+
+        Self {
+            base_command,
+            words,
+            env_vars,
+            redirection,
+            accumulated_env: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Extract the base command name from pre-tokenized words.
+    ///
+    /// Skips leading `KEY=VALUE` env var assignments to find the actual
+    /// command word, then extracts just the basename (e.g. `/usr/bin/git` → `git`).
+    pub(crate) fn base_command_from_words(words: &[Word]) -> String {
+        for word in words {
+            if word.is_assignment() {
+                continue; // skip env var assignment
+            }
+            // Extract basename from path (e.g. `/usr/bin/git` → `git`)
+            return word.basename().to_string();
+        }
+        String::new()
+    }
+
+    /// Extract leading `KEY=VALUE` env var assignments from pre-tokenized words.
+    fn env_vars_from_words(words: &[Word]) -> Vec<(String, String)> {
+        let mut result = Vec::new();
+        for word in words {
+            if let Some((key, val)) = word.as_assignment() {
+                result.push((key.to_string(), val.to_string()));
+                continue;
+            }
+            break; // first non-env-var word ends the prefix
+        }
+        result
     }
 
     /// Check if all required env var entries are satisfied.
@@ -70,7 +144,7 @@ impl<'a> CommandContext<'a> {
     }
 
     /// Get words after skipping env vars and the base command.
-    pub fn args(&self) -> &[String] {
+    pub fn args(&self) -> &[Word] {
         // Skip env var tokens and the base command itself
         let skip = self.env_vars.len() + 1; // each env var is one token in shlex, plus the command
         if self.words.len() > skip {

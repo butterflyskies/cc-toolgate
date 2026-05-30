@@ -7,6 +7,7 @@
 use super::super::CommandSpec;
 use crate::config::GitConfig;
 use crate::eval::{CommandContext, Decision, RuleMatch};
+use agent_shell_parser::parse::Word;
 use std::collections::HashMap;
 
 /// Subcommand-aware git evaluator.
@@ -57,7 +58,7 @@ impl GitSpec {
 
     /// Extract the git subcommand word (e.g. "push" from "git push origin main").
     /// Skips global flags like `-C <path>` that appear before the subcommand.
-    fn subcommand(ctx: &CommandContext) -> Option<String> {
+    fn subcommand(ctx: &CommandContext) -> Option<&Word> {
         let mut iter = ctx.words.iter();
         // Advance past env vars to find "git"
         for word in iter.by_ref() {
@@ -77,7 +78,7 @@ impl GitSpec {
                 continue;
             }
             // Not a global flag — this is the subcommand
-            return Some(word.clone());
+            return Some(word);
         }
     }
 
@@ -92,7 +93,7 @@ impl GitSpec {
 impl CommandSpec for GitSpec {
     fn evaluate(&self, ctx: &CommandContext) -> RuleMatch {
         let sub = Self::subcommand(ctx);
-        let sub_str = sub.as_deref().unwrap_or("?");
+        let sub_str: &str = sub.map(|w| w.as_str()).unwrap_or("?");
 
         // Force-push → ask regardless of config
         if sub_str == "push" {
@@ -110,7 +111,7 @@ impl CommandSpec for GitSpec {
             if let Some(ref r) = ctx.redirection {
                 return RuleMatch {
                     decision: Decision::Ask,
-                    reason: format!("git {sub_str} with {}", r.description),
+                    reason: format!("git {sub_str} with {}", r),
                 };
             }
             return RuleMatch {
@@ -125,7 +126,7 @@ impl CommandSpec for GitSpec {
                 if let Some(ref r) = ctx.redirection {
                     return RuleMatch {
                         decision: Decision::Ask,
-                        reason: format!("git {sub_str} with {}", r.description),
+                        reason: format!("git {sub_str} with {}", r),
                     };
                 }
                 return RuleMatch {

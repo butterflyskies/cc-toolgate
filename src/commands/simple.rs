@@ -35,7 +35,7 @@ impl CommandSpec for SimpleCommandSpec {
                 if let Some(ref r) = ctx.redirection {
                     return RuleMatch {
                         decision: Decision::Ask,
-                        reason: format!("{} with {}", ctx.base_command, r.description),
+                        reason: format!("{} with {}", ctx.base_command, r),
                     };
                 }
                 RuleMatch {
