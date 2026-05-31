@@ -3,10 +3,21 @@
 version = 4
 
 [[package]]
-name = "agent-shell-parser"
-version = "0.5.0"
+name = "agent-command-knowledge"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34dc478a888ee14fd2b9045642d0e26269b2104f673987701d3dc94bb4dc3266"
+checksum = "edd13f702ee2f1ff97dc7b1b053acdb38a2de6977d48c0ce1e0153dc8e836578"
+dependencies = [
+ "agent-shell-parser",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "agent-shell-parser"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72c5626a36a6741357f096e2f92cfd51ac6cee1379b140ec69c4972ac5689b1f"
 dependencies = [
  "serde",
  "serde_json",
@@ -39,6 +50,7 @@ dependencies = [
 name = "cc-toolgate"
 version = "0.6.2"
 dependencies = [
+ "agent-command-knowledge",
  "agent-shell-parser",
  "log",
  "serde",

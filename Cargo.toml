@@ -11,7 +11,8 @@ categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.95"
 
 [dependencies]
-agent-shell-parser = "0.5.0"
+agent-shell-parser = "0.6"
+agent-command-knowledge = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
