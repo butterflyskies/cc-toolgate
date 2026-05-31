@@ -103,6 +103,11 @@ pub struct GitConfig {
     /// Subcommands that are always allowed (e.g. `status`, `log`, `diff`, `branch`).
     #[serde(default)]
     pub read_only: Vec<String>,
+    /// Subcommands that are unconditionally allowed (regardless of KB classification).
+    /// Unlike `read_only`, these are not expected to be read-only — they're simply
+    /// trusted by the user (e.g. `add`).
+    #[serde(default)]
+    pub allow: Vec<String>,
     /// Subcommands that are allowed only when all `config_env` entries match
     /// (e.g. `push`, `pull` when `GIT_CONFIG_GLOBAL=~/.gitconfig.ai`).
     #[serde(default)]
@@ -238,12 +243,16 @@ struct GitOverlay {
     #[serde(default)]
     read_only: Vec<String>,
     #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
     allowed_with_config: Vec<String>,
     config_env: Option<HashMap<String, String>>,
     #[serde(default)]
     force_push_flags: Vec<String>,
     #[serde(default)]
     remove_read_only: Vec<String>,
+    #[serde(default)]
+    remove_allow: Vec<String>,
     #[serde(default)]
     remove_allowed_with_config: Vec<String>,
     #[serde(default)]
@@ -415,6 +424,7 @@ impl Config {
             &g.remove_read_only,
             g.replace,
         );
+        merge_list(&mut self.git.allow, g.allow, &g.remove_allow, g.replace);
         merge_list(
             &mut self.git.allowed_with_config,
             g.allowed_with_config,
@@ -543,6 +553,7 @@ fn strip_project_overlay_dangerous_fields(overlay: &mut ConfigOverlay, path: &st
     // git
     if overlay.git.replace
         || !overlay.git.remove_read_only.is_empty()
+        || !overlay.git.remove_allow.is_empty()
         || !overlay.git.remove_allowed_with_config.is_empty()
         || !overlay.git.remove_force_push_flags.is_empty()
     {
@@ -550,6 +561,7 @@ fn strip_project_overlay_dangerous_fields(overlay: &mut ConfigOverlay, path: &st
     }
     overlay.git.replace = false;
     overlay.git.remove_read_only.clear();
+    overlay.git.remove_allow.clear();
     overlay.git.remove_allowed_with_config.clear();
     overlay.git.remove_force_push_flags.clear();
 
@@ -1114,6 +1126,7 @@ mod tests {
             git: GitOverlay {
                 replace: true,
                 remove_read_only: vec!["status".into()],
+                remove_allow: vec!["add".into()],
                 remove_allowed_with_config: vec!["push".into()],
                 remove_force_push_flags: vec!["--force".into()],
                 read_only: vec!["log".into()],
@@ -1156,6 +1169,7 @@ mod tests {
 
         assert!(!overlay.git.replace);
         assert!(overlay.git.remove_read_only.is_empty());
+        assert!(overlay.git.remove_allow.is_empty());
         assert!(overlay.git.remove_allowed_with_config.is_empty());
         assert!(overlay.git.remove_force_push_flags.is_empty());
 
