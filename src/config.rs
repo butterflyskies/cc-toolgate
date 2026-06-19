@@ -321,6 +321,17 @@ fn merge_list(base: &mut Vec<String>, add: Vec<String>, remove: &[String], repla
     }
 }
 
+/// Remove items in `winners` from `losers`.
+///
+/// Used after merging to enforce cross-list priority: if a command
+/// appears in a higher-priority list (e.g. allow), it must be removed
+/// from lower-priority lists (e.g. ask, deny). This prevents stale
+/// entries from default config from shadowing user overrides when the
+/// registry is built with last-writer-wins insertion order.
+fn dedup_winners_over_losers(winners: &[String], losers: &mut Vec<String>) {
+    losers.retain(|item| !winners.contains(item));
+}
+
 impl Config {
     /// Load the default embedded configuration.
     pub fn default_config() -> Self {
@@ -392,6 +403,14 @@ impl Config {
         merge_list(&mut self.commands.ask, c.ask, &c.remove_ask, c.replace);
         merge_list(&mut self.commands.deny, c.deny, &c.remove_deny, c.replace);
 
+        // Cross-list dedup: allow > ask > deny.
+        // If a command was added to allow (e.g. user config promotes curl from
+        // ask to allow), remove it from ask and deny so it doesn't get clobbered
+        // by last-writer-wins in the registry.
+        dedup_winners_over_losers(&self.commands.allow, &mut self.commands.ask);
+        dedup_winners_over_losers(&self.commands.allow, &mut self.commands.deny);
+        dedup_winners_over_losers(&self.commands.ask, &mut self.commands.deny);
+
         // Wrappers
         let w = overlay.wrappers;
         merge_list(
@@ -406,6 +425,9 @@ impl Config {
             &w.remove_ask_floor,
             w.replace,
         );
+
+        // Cross-list dedup for wrappers: allow_floor > ask_floor.
+        dedup_winners_over_losers(&self.wrappers.allow_floor, &mut self.wrappers.ask_floor);
 
         // Git
         let g = overlay.git;
@@ -832,6 +854,111 @@ mod tests {
         );
         assert!(!config.commands.deny.contains(&"eval".to_string()));
         assert!(config.commands.ask.contains(&"eval".to_string()));
+    }
+
+    #[test]
+    fn overlay_promote_ask_to_allow_deduplicates() {
+        // Reproducer for the config-merge-dedup bug: curl is in the default
+        // ask list. When a user overlay adds curl to allow, it should be
+        // removed from ask. Without cross-list dedup, curl ends up in BOTH
+        // lists, and the registry's last-writer-wins makes it ASK again.
+        let mut config = Config::default_config();
+        assert!(
+            config.commands.ask.contains(&"curl".to_string()),
+            "curl should be in default ask list"
+        );
+
+        config.apply_overlay_str(
+            r#"
+            [commands]
+            allow = ["curl"]
+        "#,
+        );
+
+        assert!(
+            config.commands.allow.contains(&"curl".to_string()),
+            "curl should be in allow after overlay"
+        );
+        assert!(
+            !config.commands.ask.contains(&"curl".to_string()),
+            "curl must be removed from ask when promoted to allow"
+        );
+    }
+
+    #[test]
+    fn overlay_promote_deny_to_ask_deduplicates() {
+        // When a user promotes a command from deny to ask, it should be
+        // removed from deny without needing explicit remove_deny.
+        let mut config = Config::default_config();
+        assert!(config.commands.deny.contains(&"eval".to_string()));
+
+        config.apply_overlay_str(
+            r#"
+            [commands]
+            ask = ["eval"]
+        "#,
+        );
+
+        assert!(
+            config.commands.ask.contains(&"eval".to_string()),
+            "eval should be in ask after overlay"
+        );
+        assert!(
+            !config.commands.deny.contains(&"eval".to_string()),
+            "eval must be removed from deny when promoted to ask"
+        );
+    }
+
+    #[test]
+    fn overlay_promote_deny_to_allow_deduplicates() {
+        // Promoting from deny all the way to allow: must clear from both
+        // deny and ask.
+        let mut config = Config::default_config();
+        assert!(config.commands.deny.contains(&"eval".to_string()));
+
+        config.apply_overlay_str(
+            r#"
+            [commands]
+            allow = ["eval"]
+        "#,
+        );
+
+        assert!(
+            config.commands.allow.contains(&"eval".to_string()),
+            "eval should be in allow after overlay"
+        );
+        assert!(
+            !config.commands.deny.contains(&"eval".to_string()),
+            "eval must be removed from deny when promoted to allow"
+        );
+        assert!(
+            !config.commands.ask.contains(&"eval".to_string()),
+            "eval must not appear in ask when promoted to allow"
+        );
+    }
+
+    #[test]
+    fn wrapper_promote_ask_floor_to_allow_floor_deduplicates() {
+        // If a user moves a wrapper from ask_floor to allow_floor,
+        // cross-list dedup should remove it from ask_floor.
+        let mut config = Config::default_config();
+        assert!(config.wrappers.ask_floor.contains(&"sudo".to_string()));
+
+        config.apply_overlay_str(
+            r#"
+            [wrappers]
+            allow_floor = ["sudo"]
+        "#,
+        );
+
+        assert!(
+            config.wrappers.allow_floor.contains(&"sudo".to_string()),
+            "sudo should be in allow_floor after overlay"
+        );
+        assert!(
+            !config.wrappers.ask_floor.contains(&"sudo".to_string()),
+            "sudo must be removed from ask_floor when promoted to allow_floor"
+        );
     }
 
     #[test]

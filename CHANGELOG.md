@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.3](https://github.com/butterflyskies/cc-toolgate/compare/v0.6.2...v0.6.3) (2026-06-19)
+
+
+### Bug Fixes
+
+* **config:** cross-list dedup in config merge — when a command is promoted to a higher-priority list (e.g. user adds `curl` to `allow`), it is now automatically removed from lower-priority lists (`ask`, `deny`). Previously, the command remained in both lists after merge, and the registry's last-writer-wins insertion order caused the lower-priority entry to shadow the user's override.
+
 ## [0.6.2](https://github.com/butterflyskies/cc-toolgate/compare/v0.6.1...v0.6.2) (2026-05-29)
 
 
