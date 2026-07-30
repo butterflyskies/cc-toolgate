@@ -159,20 +159,9 @@ pub struct CommandRegistry {
 impl CommandRegistry {
     /// Build the registry from configuration.
     pub fn from_config(config: &Config) -> Self {
-        use crate::commands::{
-            simple::SimpleCommandSpec,
-            tools::{cargo::CargoSpec, gh::GhSpec, git::GitSpec, kubectl::KubectlSpec},
-        };
+        use crate::commands::{simple::SimpleCommandSpec, tools::knowledge::KnowledgeSpec};
 
         let mut specs: HashMap<String, Box<dyn CommandSpec>> = HashMap::new();
-
-        // Deny commands (registered first, complex specs override if needed)
-        for name in &config.commands.deny {
-            specs.insert(
-                name.clone(),
-                Box::new(SimpleCommandSpec::new(Decision::Deny)),
-            );
-        }
 
         // Allow commands
         for name in &config.commands.allow {
@@ -190,17 +179,31 @@ impl CommandRegistry {
             );
         }
 
-        // Complex command specs (override any simple entry for the same name)
-        specs.insert("git".into(), Box::new(GitSpec::from_config(&config.git)));
-        specs.insert(
-            "cargo".into(),
-            Box::new(CargoSpec::from_config(&config.cargo)),
-        );
-        specs.insert(
-            "kubectl".into(),
-            Box::new(KubectlSpec::from_config(&config.kubectl)),
-        );
-        specs.insert("gh".into(), Box::new(GhSpec::from_config(&config.gh)));
+        // KB-backed spec for subcommand-aware commands.
+        // Replaces per-tool specs (GitSpec, CargoSpec, GhSpec, KubectlSpec)
+        // with a unified evaluator that delegates to classify().
+        // Only registered for commands that have subcommand-aware evaluation
+        // in the KB — simple read-only/mutating commands are already covered
+        // by the allow/ask/deny lists above.
+        let kb_spec = KnowledgeSpec::from_config(config);
+        let kb = agent_command_knowledge::default_knowledge_base();
+        for cmd_name in kb.commands.keys() {
+            // Only register KB spec for commands that have subcommands defined
+            // (these benefit from subcommand-aware evaluation).
+            let cmd_knowledge = &kb.commands[cmd_name];
+            if !cmd_knowledge.subcommands.is_empty() {
+                specs.insert(cmd_name.clone(), Box::new(kb_spec.clone()));
+            }
+        }
+
+        // Deny commands (registered AFTER KB so deny always wins — a future KB
+        // version cannot accidentally override a deny-listed command).
+        for name in &config.commands.deny {
+            specs.insert(
+                name.clone(),
+                Box::new(SimpleCommandSpec::new(Decision::Deny)),
+            );
+        }
 
         // Wrapper commands: these execute their arguments as subcommands.
         // Remove them from the specs map (they're handled separately in evaluate_single).

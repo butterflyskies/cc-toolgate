@@ -18,7 +18,6 @@
 //! here — they test parser/context internals, not command disposition.
 
 use Decision::*;
-use cc_toolgate::commands::CommandSpec;
 use cc_toolgate::eval::Decision;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -997,23 +996,19 @@ fn spec_escalate_deny() {
 // ENV-GATED TESTS (custom config per tool)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Helper: build a git env-gate spec and evaluate.
+/// Helper: build a git env-gate config and evaluate through KnowledgeSpec.
 fn git_env_gate_decision(cmd: &str) -> Decision {
-    use cc_toolgate::config::GitConfig;
+    use cc_toolgate::commands::CommandSpec;
+    use cc_toolgate::commands::tools::knowledge::KnowledgeSpec;
     use cc_toolgate::eval::CommandContext;
     use std::collections::HashMap;
 
-    let spec = cc_toolgate::commands::tools::git::GitSpec::from_config(&GitConfig {
-        read_only: vec![
-            "status".into(),
-            "log".into(),
-            "diff".into(),
-            "branch".into(),
-        ],
-        allowed_with_config: vec!["push".into(), "pull".into(), "add".into()],
-        config_env: HashMap::from([("GIT_CONFIG_GLOBAL".into(), "~/.gitconfig.ai".into())]),
-        force_push_flags: vec!["--force".into(), "-f".into(), "--force-with-lease".into()],
-    });
+    let mut config = cc_toolgate::config::Config::default_config();
+    config.git.allowed_with_config = vec!["push".into(), "pull".into(), "add".into()];
+    config.git.config_env = HashMap::from([("GIT_CONFIG_GLOBAL".into(), "~/.gitconfig.ai".into())]);
+    config.git.force_push_flags = vec!["--force".into(), "-f".into(), "--force-with-lease".into()];
+
+    let spec = KnowledgeSpec::from_config(&config);
     let ctx = CommandContext::from_command(cmd);
     spec.evaluate(&ctx).decision
 }
@@ -1029,17 +1024,18 @@ fn spec_git_env_gate() {
     }
 }
 
-/// Helper: build a cargo env-gate spec and evaluate.
+/// Helper: build a cargo env-gate config and evaluate through KnowledgeSpec.
 fn cargo_env_gate_decision(cmd: &str) -> Decision {
-    use cc_toolgate::config::CargoConfig;
+    use cc_toolgate::commands::CommandSpec;
+    use cc_toolgate::commands::tools::knowledge::KnowledgeSpec;
     use cc_toolgate::eval::CommandContext;
     use std::collections::HashMap;
 
-    let spec = cc_toolgate::commands::tools::cargo::CargoSpec::from_config(&CargoConfig {
-        safe_subcommands: vec!["build".into(), "check".into(), "test".into()],
-        allowed_with_config: vec!["install".into(), "publish".into()],
-        config_env: HashMap::from([("CARGO_INSTALL_ROOT".into(), "/tmp/bin".into())]),
-    });
+    let mut config = cc_toolgate::config::Config::default_config();
+    config.cargo.allowed_with_config = vec!["install".into(), "publish".into()];
+    config.cargo.config_env = HashMap::from([("CARGO_INSTALL_ROOT".into(), "/tmp/bin".into())]);
+
+    let spec = KnowledgeSpec::from_config(&config);
     let ctx = CommandContext::from_command(cmd);
     spec.evaluate(&ctx).decision
 }
@@ -1055,18 +1051,18 @@ fn spec_cargo_env_gate() {
     }
 }
 
-/// Helper: build a gh env-gate spec and evaluate.
+/// Helper: build a gh env-gate config and evaluate through KnowledgeSpec.
 fn gh_env_gate_decision(cmd: &str) -> Decision {
-    use cc_toolgate::config::GhConfig;
+    use cc_toolgate::commands::CommandSpec;
+    use cc_toolgate::commands::tools::knowledge::KnowledgeSpec;
     use cc_toolgate::eval::CommandContext;
     use std::collections::HashMap;
 
-    let spec = cc_toolgate::commands::tools::gh::GhSpec::from_config(&GhConfig {
-        read_only: vec!["pr list".into(), "pr view".into(), "status".into()],
-        mutating: vec!["repo delete".into()],
-        allowed_with_config: vec!["pr create".into(), "pr merge".into()],
-        config_env: HashMap::from([("GH_CONFIG_DIR".into(), "~/.config/gh-ai".into())]),
-    });
+    let mut config = cc_toolgate::config::Config::default_config();
+    config.gh.allowed_with_config = vec!["pr create".into(), "pr merge".into()];
+    config.gh.config_env = HashMap::from([("GH_CONFIG_DIR".into(), "~/.config/gh-ai".into())]);
+
+    let spec = KnowledgeSpec::from_config(&config);
     let ctx = CommandContext::from_command(cmd);
     spec.evaluate(&ctx).decision
 }
@@ -1082,18 +1078,18 @@ fn spec_gh_env_gate() {
     }
 }
 
-/// Helper: build a kubectl env-gate spec and evaluate.
+/// Helper: build a kubectl env-gate config and evaluate through KnowledgeSpec.
 fn kubectl_env_gate_decision(cmd: &str) -> Decision {
-    use cc_toolgate::config::KubectlConfig;
+    use cc_toolgate::commands::CommandSpec;
+    use cc_toolgate::commands::tools::knowledge::KnowledgeSpec;
     use cc_toolgate::eval::CommandContext;
     use std::collections::HashMap;
 
-    let spec = cc_toolgate::commands::tools::kubectl::KubectlSpec::from_config(&KubectlConfig {
-        read_only: vec!["get".into(), "describe".into()],
-        mutating: vec!["delete".into()],
-        allowed_with_config: vec!["apply".into(), "rollout".into()],
-        config_env: HashMap::from([("KUBECONFIG".into(), "~/.kube/config.ai".into())]),
-    });
+    let mut config = cc_toolgate::config::Config::default_config();
+    config.kubectl.allowed_with_config = vec!["apply".into(), "rollout".into()];
+    config.kubectl.config_env = HashMap::from([("KUBECONFIG".into(), "~/.kube/config.ai".into())]);
+
+    let spec = KnowledgeSpec::from_config(&config);
     let ctx = CommandContext::from_command(cmd);
     spec.evaluate(&ctx).decision
 }
